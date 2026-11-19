@@ -61,7 +61,8 @@ python3 decode_jpeg.py samples/map_Rx.txt samples/image.jpg
 | `mars/vision.py` | `analyze_frame`, `annotate`, `skeleton_length_px` |
 | `mars/aruco.py` | `detect_markers`, `annotate_markers`: ArUco id, центр, сторона в px |
 | `mars/scale.py` | `px_per_meter(markers, marker_size_m)` — масштаб по маркеру (B2) |
-| `mars/arrow_routes.py` | `detect_arrow_routes`, `annotate_arrow_routes`: цепочки стрелок между метками (B4) |
+| `mars/arrow_routes.py` | `detect_arrow_routes`, `detect_arrows`, `routes_from_arrows`, `annotate_arrow_routes`: цепочки стрелок между метками (B4) |
+| `mars/fusion.py` | `fuse_routes`: сшивка нескольких кадров по меткам и голосование по каждой стрелке |
 | `mars/flight.py` | `FlightAdapter`, `SimulatedAdapter`, `PioneerAdapter` поверх `DroneLink` |
 | `mars/drone.py` | `DroneLink`/`SimulatedLink`: SDK 2, телеметрия, камера, фото |
 | `mars/teleop.py` | клавиши → скорости, затухание импульса |
@@ -117,15 +118,18 @@ python3 drone_tui.py --local                   # на борту
 
 ```bash
 python3 photo_mission.py --dry-run                # последовательность без железа
-python3 photo_mission.py --local                  # вниз, 2.7 м, точка (0.5, 0.5), фото, посадка
+python3 photo_mission.py --local                  # вниз, 2.7 м, 5 остановок, посадка
 python3 photo_mission.py --local --altitude 3.0   # ключевой параметр — высота
 python3 photo_mission.py --local --target-x 1.0 --target-y 1.0
+python3 photo_mission.py --local --stops 1        # одно фото в конечной точке
+python3 photo_mission.py --local --annotate-all   # разметить каждый кадр
 ```
 
-- Последовательность: наклон камеры `--tilt` (по умолчанию −90°), взлёт, набор `--altitude` над точкой взлёта закрытым контуром по LPS (fallback — барометр), перелёт в `--target-x`/`--target-y` (по умолчанию 0.5/0.5 м от точки взлёта) с удержанием высоты, пауза `--settle`, фото с повторами, снижение до `--landing-height` и полная посадка в этой точке.
-- Перелёт тоже закрытый контур по LPS: координаты точки взлёта запоминаются после взлёта, тело-фиксированные скорости поворачиваются на текущий yaw; допуск `--move-tolerance`, скорость `--move-speed`, таймаут `--move-timeout`.
+- Последовательность: наклон камеры `--tilt` (по умолчанию −90°), взлёт, набор `--altitude` над точкой взлёта закрытым контуром по LPS (fallback — барометр), перелёт к `--target-x`/`--target-y` (по умолчанию 0.5/0.5 м от точки взлёта) **с остановками**: `--stops` (по умолчанию 5) делит путь на равные шаги 0, 25, 50, 75 и 100%. На каждой остановке пауза `--settle` и фото с повторами; затем снижение до `--landing-height` и полная посадка в конечной точке.
+- После посадки все кадры анализируются: кадры без ArUco-меток отбрасываются, остальные совмещаются по центрам общих меток (гомография, проверка по углам меток), и решение принимается **по каждой стрелке**: позиция считается настоящей, если её подтвердили 2 кадра из 3 (3 из 5). Потеря стрелки на одном кадре и светлое пятно на другом не меняют счёт. Опорный кадр размечается в `<фото>_annotated.png`; `--annotate-all` размечает ещё и каждый исходный кадр в `<фото>_annotated_frame.png`. Маршруты печатаются по возрастанию длины, дополнительно выводится 2-й по длине — ответ задания 2. Если сшить кадры нельзя (меньше двух общих меток, гомография не сошлась, подтверждено меньше двух стрелок), скрипт откатывается на лучший одиночный кадр.
+- Перелёт тоже закрытый контур по LPS: координаты точки взлёта запоминаются после взлёта, тело-фиксированные скорости поворачиваются на текущий yaw; допуск `--move-tolerance`, скорость `--move-speed`, таймаут `--move-timeout` (на каждый отрезок).
 - Наклон сервопривода доступен только в `--local`; без него скрипт предупреждает, пишет `tilt_unavailable` в журнал и продолжает миссию.
-- Наклон удерживается повтором раз в секунду. Шаги (`mission_start`, `takeoff_reference`, `climb_progress`, `move_progress`, `move_done`, `photo`, `descent_done`, `land`, `mission_complete`) и ошибки — в `logs/flight_*.jsonl`.
+- Наклон удерживается повтором раз в секунду. Шаги (`mission_start`, `takeoff_reference`, `climb_progress`, `stop_start`, `stop_done`, `move_progress`, `move_done`, `photo`, `descent_done`, `land`, `mission_complete`) и ошибки — в `logs/flight_*.jsonl`.
 - Ошибка или Ctrl+C → аварийная посадка, код возврата 1/130; нет связи — 2. Полный список флагов прокомментирован в шапке `photo_mission.py`.
 
 ### Сеть дрона — читать перед подключением

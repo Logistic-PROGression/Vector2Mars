@@ -30,6 +30,7 @@ import argparse
 import math
 import sys
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -191,6 +192,103 @@ def detect_arrow_routes(
         return []
 
     arrows = _find_arrows(bgr, marker_list, unit)
+    return _routes_from_internal(
+        arrows,
+        marker_list,
+        unit,
+        (bgr.shape[0], bgr.shape[1]),
+        px_per_meter,
+        min_arrows,
+    )
+
+
+def detect_arrows(
+    image: object,
+    markers: list[Marker] | None = None,
+    *,
+    dictionary: str = DEFAULT_DICTIONARY,
+) -> list[Arrow]:
+    """Return arrow candidates with the direction their head points to.
+
+    This is the single-frame half of :func:`detect_arrow_routes`. It is used by
+    :mod:`mars.fusion`, which has to vote on individual arrows from several
+    photos instead of trusting the route count of one frame.
+    """
+    bgr = _as_bgr(image)
+    if bgr is None:
+        return []
+    if markers is None:
+        markers = detect_markers(bgr, dictionary)
+    marker_list = sorted(markers or (), key=lambda marker: marker.id)
+    if len(marker_list) < 2:
+        return []
+    unit = float(np.median([marker.side_px for marker in marker_list]))
+    if not math.isfinite(unit) or unit <= 0:
+        return []
+    return [_public_arrow(arrow) for arrow in _find_arrows(bgr, marker_list, unit)]
+
+
+def routes_from_arrows(
+    arrows: Sequence[Arrow],
+    markers: list[Marker] | None,
+    *,
+    px_per_meter: float | None = None,
+    frame_shape: tuple[int, int] | None = None,
+    min_arrows: int = 2,
+) -> list[ArrowRoute]:
+    """Build marker-to-marker routes from already detected arrows.
+
+    Frames of the same field are shifted relative to each other, so
+    :mod:`mars.fusion` maps their arrows into one reference frame and rebuilds
+    the chains here. ``frame_shape`` is the reference frame size ``(height,
+    width)``; without it the frame-border rule is disabled.
+    """
+    if markers is None:
+        return []
+    marker_list = sorted(markers, key=lambda marker: marker.id)
+    if len(marker_list) < 2:
+        return []
+    unit = float(np.median([marker.side_px for marker in marker_list]))
+    if not math.isfinite(unit) or unit <= 0:
+        return []
+    internal: list[_Arrow] = []
+    for index, arrow in enumerate(arrows):
+        direction = np.asarray(arrow.direction, dtype=np.float64)
+        norm = float(np.linalg.norm(direction))
+        center = np.asarray(arrow.center, dtype=np.float64)
+        if (
+            not math.isfinite(norm)
+            or norm <= 1e-9
+            or center.shape != (2,)
+            or not bool(np.all(np.isfinite(center)))
+        ):
+            continue
+        internal.append(
+            _Arrow(
+                index=index,
+                center=center,
+                axis=direction / norm,
+                head_sign=1,
+                area_px=arrow.area_px,
+                length_px=arrow.length_px,
+                color=arrow.color,
+            )
+        )
+    shape = frame_shape if frame_shape is not None else (10**9, 10**9)
+    return _routes_from_internal(
+        internal, marker_list, unit, shape, px_per_meter, min_arrows
+    )
+
+
+def _routes_from_internal(
+    arrows: list[_Arrow],
+    marker_list: list[Marker],
+    unit: float,
+    frame_shape: tuple[int, int],
+    px_per_meter: float | None,
+    min_arrows: int,
+) -> list[ArrowRoute]:
+    """Link arrow candidates into routes; shared by both public detectors."""
     if len(arrows) < min_arrows:
         return []
 
@@ -204,9 +302,7 @@ def detect_arrow_routes(
         path = _order_chain(adjacency, component, arrows)
         if len(path) < min_arrows:
             continue
-        chain = _match_markers(
-            path, arrows, marker_list, unit, (bgr.shape[0], bgr.shape[1])
-        )
+        chain = _match_markers(path, arrows, marker_list, unit, frame_shape)
         if chain is not None:
             chains.append(chain)
 
@@ -224,6 +320,23 @@ def detect_arrow_routes(
         used_arrows.update(indices)
         routes.append(_to_public(chain, px_per_meter, unit))
     return routes
+
+
+def _public_arrow(arrow: _Arrow) -> Arrow:
+    """Convert an internal candidate so its direction points at the head."""
+    axis = arrow.axis if arrow.head_sign >= 0 else -arrow.axis
+    norm = float(np.linalg.norm(axis))
+    if not math.isfinite(norm) or norm <= 1e-9:
+        axis = np.asarray((1.0, 0.0))
+    else:
+        axis = axis / norm
+    return Arrow(
+        center=(float(arrow.center[0]), float(arrow.center[1])),
+        direction=(float(axis[0]), float(axis[1])),
+        area_px=arrow.area_px,
+        length_px=arrow.length_px,
+        color=arrow.color,
+    )
 
 
 def second_longest_route(routes: list[ArrowRoute]) -> ArrowRoute | None:

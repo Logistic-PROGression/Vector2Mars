@@ -9,7 +9,12 @@ import cv2
 import numpy as np
 
 from mars.aruco import detect_markers
-from mars.arrow_routes import annotate_arrow_routes, detect_arrow_routes
+from mars.arrow_routes import (
+    annotate_arrow_routes,
+    detect_arrow_routes,
+    detect_arrows,
+    routes_from_arrows,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SATELLITE = REPO_ROOT / "samples" / "image.jpg"
@@ -366,6 +371,23 @@ class SatelliteArrowRouteTest(unittest.TestCase):
         route = routes[0]
         self.assertEqual((route.start_marker_id, route.end_marker_id), (0, 2))
         self.assertEqual(len(route.arrows), 3)
+
+    def test_arrow_api_keeps_the_same_route(self):
+        image = cv2.imread(str(SATELLITE))
+        self.assertIsNotNone(image)
+        markers = detect_markers(image)
+        arrows = detect_arrows(image, markers)
+        self.assertGreaterEqual(len(arrows), 3)
+        for arrow in arrows:
+            norm = float(np.linalg.norm(np.asarray(arrow.direction)))
+            self.assertAlmostEqual(norm, 1.0, places=6)
+
+        routes = routes_from_arrows(arrows, markers)
+        self.assertEqual(len(routes), 1)
+        route = routes[0]
+        self.assertEqual((route.start_marker_id, route.end_marker_id), (0, 2))
+        self.assertEqual(len(route.arrows), 3)
+        self.assertGreater(route.length_px, 0.0)
 
 
 if __name__ == "__main__":

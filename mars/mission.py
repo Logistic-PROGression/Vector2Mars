@@ -1,8 +1,10 @@
 """Automated photo mission on top of :class:`mars.drone.DroneLink`.
 
 Sequence: tilt the camera straight down, take off, climb to a target height
-above the takeoff point, fly to a target point relative to the takeoff point,
-settle, take a photo, descend and land.
+above the takeoff point, then fly the route to the target point in equal
+steps. At every step the drone settles and takes a photo, so a frame where
+the field is cut by the border can be replaced by an earlier one. After the
+last stop it descends and lands at the target point.
 
 The module has no curses and no CLI. It is one synchronous function so the
 whole sequence can be exercised against ``SimulatedLink`` or a fake link with
@@ -63,6 +65,12 @@ class MissionConfig:
     settle_s: float = 1.5
     tilt_settle_s: float = 1.0
     landing_height_m: float = 0.25
+    # Number of stops on the route from the takeoff point to the target.
+    # Stops are spread evenly from 0 to 100%: five stops give 0, 25, 50, 75
+    # and 100% of the way, so even when the last frame is partly out of view
+    # the earlier ones keep the whole field. One stop keeps the old behaviour
+    # of a single photo at the target point.
+    stop_count: int = 5
     photo_retries: int = 3
     photo_delay_s: float = 0.7
     climb_timeout_s: float = 60.0
@@ -93,6 +101,8 @@ class MissionConfig:
             raise ValueError("паузы не могут быть отрицательными")
         if self.photo_retries < 1:
             raise ValueError("нужна хотя бы одна попытка фото")
+        if self.stop_count < 1:
+            raise ValueError("нужна хотя бы одна остановка для фото")
         if (
             self.climb_timeout_s <= 0
             or self.descend_timeout_s <= 0
@@ -102,11 +112,24 @@ class MissionConfig:
         if self.servo_priority not in ("low", "medium", "high"):
             raise ValueError("приоритет сервопривода: low, medium или high")
 
+    @property
+    def stop_fractions(self) -> tuple[float, ...]:
+        """Fractions of the route where the drone stops for a photo.
+
+        ``0.0`` is the takeoff point, ``1.0`` is the target point. A single
+        stop stays at the target so ``stop_count=1`` reproduces the previous
+        one-photo mission.
+        """
+        if self.stop_count == 1:
+            return (1.0,)
+        return tuple(index / (self.stop_count - 1) for index in range(self.stop_count))
+
 
 @dataclass
 class MissionResult:
     ok: bool = False
     photo: Path | None = None
+    photos: list[Path] = dataclasses.field(default_factory=list)
     photo_attempts: int = 0
     climbed_m: float | None = None
     elapsed_s: float = 0.0
@@ -306,30 +329,34 @@ def _climb(
         sleep(LOOP_S)
 
 
-def _move_to_target(
+def _move_to_point(
     link: DroneLink,
     config: MissionConfig,
     baseline: Telemetry,
     takeoff_point: tuple[float, float, float],
+    offset_x_m: float,
+    offset_y_m: float,
+    stop: int,
     logger: FlightLogger,
     notice: Callable[[str], None],
     clock: Callable[[], float],
     sleep: Callable[[float], None],
     tilt: _TiltHold,
 ) -> None:
-    """Fly horizontally to ``target_x_m``/``target_y_m`` from the takeoff point.
+    """Fly horizontally to a point relative to the takeoff point.
 
     The target is expressed in the LPS frame, while ``set_velocity`` is
     body-fixed, so the world-frame velocity is rotated by the current yaw. The
-    altitude is held with the same proportional controller as the climb.
+    altitude is held with the same proportional controller as the climb. The
+    same function serves every stop on the route, only the offset changes.
     """
-    target_x = takeoff_point[0] + config.target_x_m
-    target_y = takeoff_point[1] + config.target_y_m
+    target_x = takeoff_point[0] + offset_x_m
+    target_y = takeoff_point[1] + offset_y_m
     started = clock()
     last_log = started
     notice(
-        f"Полёт к точке x={config.target_x_m:.2f}, y={config.target_y_m:.2f} м "
-        "от взлёта…"
+        f"Остановка {stop + 1}/{config.stop_count}: "
+        f"полёт к x={offset_x_m:.2f}, y={offset_y_m:.2f} м от взлёта…"
     )
 
     while True:
@@ -346,6 +373,7 @@ def _move_to_target(
             elapsed = clock() - started
             logger.log(
                 "move_done",
+                stop=stop,
                 x=round(float(telemetry.position[0]), 2),
                 y=round(float(telemetry.position[1]), 2),
                 target_x=round(target_x, 2),
@@ -390,6 +418,7 @@ def _move_to_target(
             last_log = clock()
             logger.log(
                 "move_progress",
+                stop=stop,
                 x=round(float(telemetry.position[0]), 2),
                 y=round(float(telemetry.position[1]), 2),
                 error_m=round(distance, 2),
@@ -425,20 +454,22 @@ def _take_photo(
     clock: Callable[[], float],
     sleep: Callable[[float], None],
     tilt: _TiltHold,
+    stop: int | None = None,
 ) -> tuple[Path | None, int]:
     for attempt in range(1, config.photo_retries + 1):
         path = None
         try:
             path = link.take_photo(photo_dir)
         except Exception as exc:
-            logger.log("photo_error", attempt=attempt, error=str(exc))
+            logger.log("photo_error", attempt=attempt, stop=stop, error=str(exc))
         if path is not None:
-            logger.log("photo", path=str(path), attempt=attempt)
+            logger.log("photo", path=str(path), attempt=attempt, stop=stop)
             notice(f"Фото сохранено: {path}")
             return Path(path), attempt
         logger.log(
             "photo_failed",
             attempt=attempt,
+            stop=stop,
             camera_error=getattr(link, "camera_error", None),
         )
         notice(f"Кадр не получен (попытка {attempt} из {config.photo_retries})")
@@ -555,7 +586,7 @@ def run_photo_mission(
     notice(
         f"Миссия: камера {config.tilt_deg:.0f}°, высота {config.altitude_m:.2f} м, "
         f"точка ({config.target_x_m:.2f}, {config.target_y_m:.2f}) м от взлёта, "
-        "фото, посадка"
+        f"остановок {config.stop_count}, фото, посадка"
     )
 
     airborne = False
@@ -594,27 +625,44 @@ def run_photo_mission(
             link, config, baseline, logger, notice, clock, sleep, tilt
         )
 
-        # 4. Fly to the requested point above the field.
-        _move_to_target(
-            link,
-            config,
-            baseline,
-            takeoff_point,
-            logger,
-            notice,
-            clock,
-            sleep,
-            tilt,
-        )
+        # 4. Fly the route in equal steps, stopping to photograph at each one.
+        for stop, fraction in enumerate(config.stop_fractions):
+            logger.log("stop_start", stop=stop, fraction=fraction)
+            if fraction > 0.0:
+                _move_to_point(
+                    link,
+                    config,
+                    baseline,
+                    takeoff_point,
+                    config.target_x_m * fraction,
+                    config.target_y_m * fraction,
+                    stop,
+                    logger,
+                    notice,
+                    clock,
+                    sleep,
+                    tilt,
+                )
 
-        # 5. Wait for the airframe and the frame to settle.
-        _settle(link, config, tilt, clock, sleep)
+            # 5. Wait for the airframe and the frame to settle.
+            _settle(link, config, tilt, clock, sleep)
 
-        # 6. Photo.
-        result.photo, result.photo_attempts = _take_photo(
-            link, config, logger, photo_dir, notice, clock, sleep, tilt
-        )
-        if result.photo is None:
+            # 6. Photo at this stop.
+            photo, attempts = _take_photo(
+                link, config, logger, photo_dir, notice, clock, sleep, tilt, stop=stop
+            )
+            result.photo_attempts += attempts
+            if photo is not None:
+                result.photos.append(photo)
+                result.photo = photo
+            logger.log(
+                "stop_done",
+                stop=stop,
+                fraction=fraction,
+                photo=None if photo is None else str(photo),
+            )
+
+        if not result.photos:
             result.reason = "фото не получено"
 
         # 7. Descend under control, then land.
@@ -622,9 +670,9 @@ def run_photo_mission(
         _land(link, logger, notice)
         airborne = False
 
-        result.ok = result.photo is not None
+        result.ok = bool(result.photos)
         if result.ok:
-            notice(f"Миссия завершена: {result.photo}")
+            notice(f"Миссия завершена: кадров {len(result.photos)}")
         else:
             notice("Миссия завершена без фото")
     except KeyboardInterrupt:
@@ -654,6 +702,7 @@ def run_photo_mission(
             ok=result.ok,
             reason=result.reason,
             photo=None if result.photo is None else str(result.photo),
+            photos=[str(photo) for photo in result.photos],
             photo_attempts=result.photo_attempts,
             climbed_m=None if result.climbed_m is None else round(result.climbed_m, 2),
             elapsed_s=result.elapsed_s,

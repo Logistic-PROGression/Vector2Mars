@@ -5,10 +5,17 @@
   1. камера переводится вниз (по умолчанию -90°, максимально вниз);
   2. дрон взлетает;
   3. набор высоты над точкой взлёта (по умолчанию 2.7 м);
-  4. перелёт в точку (по умолчанию 0.5, 0.5 м от точки взлёта);
-  5. пауза на стабилизацию;
-  6. фото в --photo-dir;
-  7. снижение и полная посадка в этой точке.
+  4. перелёт к точке (по умолчанию 0.5, 0.5 м от взлёта) с 5 остановками
+     (0, 25, 50, 75 и 100% пути); на каждой — пауза на стабилизацию и фото;
+  5. снижение и полная посадка в конечной точке;
+  6. после посадки кадры анализируются: кадры без меток отбрасываются,
+     остальные совмещаются по центрам ArUco-меток, стрелки голосуются по
+     каждой позиции (2 из 3, 3 из 5), поэтому потеря одной стрелки на кадре
+     не портит счёт; маршруты выводятся по возрастанию длины.
+
+Метки должны быть видны целиком хотя бы на двух кадрах: по четырём центрам
+строится гомография, по углам меток она проверяется. Если сшить кадры нельзя,
+скрипт откатывается на лучший одиночный кадр.
 
 Наклон сервопривода работает только на борту (Unix-сокет /tmp/servo.sock),
 поэтому для наклона камеры запускайте с --local. С ноутбука миссия всё равно
@@ -36,6 +43,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 from mars.drone import (
@@ -69,6 +77,7 @@ from mars.mission import MissionConfig, run_photo_mission
 #   --move-timeout 60       предел времени перелёта в точку, с
 #   --tolerance 0.05        допуск по высоте, м (когда считаем цель достигнутой)
 #   --settle 1.5            пауза на стабилизацию перед фото, с
+#   --stops 5               сколько остановок с фото на пути (5 → 0, 25, 50, 75, 100%)
 #   --tilt-settle 1.0       пауза после команды наклона камеры, с
 #   --landing-height 0.25   высота над землёй, с которой начинается посадка, м
 #   --photo-retries 3       сколько раз пытаться получить кадр
@@ -82,13 +91,17 @@ from mars.mission import MissionConfig, run_photo_mission
 #   --dry-run               симулятор без дрона и SDK
 #   --photo-dir photos      куда сохранять фото
 #   --log-dir logs          куда писать JSONL-журнал
+#   --annotate-all          разметить не только итоговый, но и все кадры
 # ---------------------------------------------------------------------------
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     defaults = MissionConfig()
     parser = argparse.ArgumentParser(
-        description="Фото-миссия: камера вниз, взлёт, высота, перелёт в точку, фото, посадка.",
+        description=(
+            "Фото-миссия: камера вниз, взлёт, высота, перелёт с остановками, "
+            "фото, посадка."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -205,6 +218,13 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="пауза на стабилизацию перед фото",
     )
     parser.add_argument(
+        "--stops",
+        type=int,
+        default=defaults.stop_count,
+        metavar="N",
+        help="число остановок с фото на пути: 5 — равные шаги от взлёта до цели",
+    )
+    parser.add_argument(
         "--tilt-settle",
         type=float,
         default=defaults.tilt_settle_s,
@@ -281,6 +301,11 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default="logs",
         help="куда писать журнал полёта",
     )
+    parser.add_argument(
+        "--annotate-all",
+        action="store_true",
+        help="разметить все кадры, а не только итоговый",
+    )
     return parser.parse_args(argv)
 
 
@@ -288,51 +313,202 @@ def _notice(text: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {text}", flush=True)
 
 
-def _report_routes(photo: Path, logger: FlightLogger) -> None:
-    """Analyse the mission photo and print the second longest route.
+def _analyse_photos(
+    photos: list[Path],
+    logger: FlightLogger,
+    *,
+    annotate_all: bool = False,
+) -> None:
+    """Mark the stop photos, fuse them and report the routes.
 
-    Task 2 wants the route that is second by length. Vision is optional: any
-    failure is logged and reported, but it never changes the mission result.
+    Every readable frame is analysed. Frames without markers are ignored: the
+    field is already out of the picture there. The remaining frames are
+    aligned by their ArUco centres and vote per arrow, so one frame that lost
+    an arrow or invented a bright patch cannot change the result. If the
+    frames cannot be aligned, the best single frame is used. Routes are
+    printed shortest first.
     """
     try:
         import cv2  # noqa: PLC0415 - optional heavy dependency
 
+        from mars.aruco import detect_markers  # noqa: PLC0415
         from mars.arrow_routes import (  # noqa: PLC0415
-            detect_arrow_routes,
+            COLOUR_BLUE,
+            COLOUR_LABELS_RU,
+            COLOUR_RED,
+            COLOUR_WHITE,
+            annotate_arrow_routes,
+            detect_arrows,
+            routes_from_arrows,
             second_longest_route,
         )
-
-        frame = cv2.imread(str(photo))
-        routes = detect_arrow_routes(frame) if frame is not None else []
-        second = second_longest_route(routes)
+        from mars.fusion import FrameObservation, fuse_routes  # noqa: PLC0415
     except Exception as exc:  # noqa: BLE001 - never fail the mission on vision
         logger.log("route_error", error=str(exc))
         _notice(f"Маршруты не посчитаны: {exc}")
         return
 
-    ranked = sorted(routes, key=lambda route: route.length_px, reverse=True)
+    observations: list[FrameObservation] = []
+    for photo in photos:
+        try:
+            frame = cv2.imread(str(photo))
+        except cv2.error:
+            frame = None
+        if frame is None:
+            logger.log("frame_unreadable", photo=str(photo))
+            continue
+        try:
+            markers = detect_markers(frame)
+            arrows = detect_arrows(frame, markers)
+            routes = routes_from_arrows(
+                arrows,
+                markers,
+                frame_shape=(frame.shape[0], frame.shape[1]),
+            )
+        except Exception as exc:  # noqa: BLE001 - one bad frame is not fatal
+            logger.log("frame_error", photo=str(photo), error=str(exc))
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        observations.append(
+            FrameObservation(
+                path=Path(photo),
+                image=frame,
+                markers=tuple(markers),
+                arrows=tuple(arrows),
+                routes=tuple(routes),
+                sharpness=sharpness,
+            )
+        )
+        logger.log(
+            "frame_analysed",
+            photo=str(photo),
+            markers=len(markers),
+            routes=len(routes),
+            arrows=sum(len(route.arrows) for route in routes),
+            candidates=len(arrows),
+            sharpness=round(sharpness, 1),
+        )
+
+    if not observations:
+        _notice("Кадры не прочитаны — маршруты не посчитаны")
+        return
+
+    fused = fuse_routes(observations)
+    reference = fused.reference
+    if reference is None:
+        _notice("Метки не найдены — маршруты не посчитаны")
+        return
+
+    if fused.mode == "fusion":
+        counts = ", ".join(str(count) for count in fused.frame_counts)
+        line = (
+            f"Сшито кадров {len(fused.used)} ({counts}) → "
+            f"подтверждено {fused.confirmed}"
+        )
+        if fused.dropped:
+            line += f", отброшено {fused.dropped}"
+        _notice(line)
+    else:
+        _notice(f"Сшивка не удалась ({fused.note}); беру лучший кадр")
+
+    ranked = sorted(fused.routes, key=lambda route: route.length_px)
+    second = second_longest_route(ranked)
+
+    frame_name = reference.path.name if reference.path is not None else "?"
+    _notice(
+        f"Размечен кадр {frame_name}: меток {len(reference.markers)}, "
+        f"маршрутов {len(ranked)}"
+    )
+    for rank, route in enumerate(ranked, 1):
+        mixed = Counter(route.colors)
+        breakdown = ", ".join(
+            f"{COLOUR_LABELS_RU[color]} {mixed[color]}"
+            for color in (COLOUR_RED, COLOUR_BLUE, COLOUR_WHITE)
+            if mixed[color]
+        )
+        _notice(
+            f"{rank}. {route.start_marker_id} -> {route.end_marker_id}: "
+            f"стрелок {len(route.arrows)} ({breakdown}), "
+            f"{route.length_px:.0f} px"
+        )
+
     summary = [
         {
             "start": route.start_marker_id,
             "end": route.end_marker_id,
             "arrows": len(route.arrows),
+            "colors": dict(Counter(route.colors)),
             "length_px": round(route.length_px, 1),
         }
         for route in ranked
     ]
     logger.log(
         "routes",
-        count=len(routes),
-        second=None if second is None else summary[1],
+        frame=str(reference.path) if reference.path is not None else None,
+        mode=fused.mode,
+        note=fused.note,
+        used_frames=[
+            str(observation.path) for observation in fused.used
+        ],
+        frame_counts=list(fused.frame_counts),
+        confirmed=fused.confirmed,
+        dropped=fused.dropped,
+        markers=[marker.id for marker in reference.markers],
+        count=len(ranked),
+        second=None if second is None else summary[ranked.index(second)],
         routes=summary,
     )
+
+    try:
+        overlay = annotate_arrow_routes(
+            reference.image, list(fused.routes), list(reference.markers)
+        )
+        if reference.path is None:
+            raise ValueError("у опорного кадра нет пути")
+        annotated = reference.path.with_name(
+            reference.path.stem + "_annotated.png"
+        )
+        if cv2.imwrite(str(annotated), overlay):
+            _notice(f"Разметка сохранена: {annotated}")
+        else:
+            logger.log("annotate_failed", photo=str(annotated))
+    except Exception as exc:  # noqa: BLE001 - annotation is a bonus
+        logger.log("annotate_error", error=str(exc))
+
+    if annotate_all:
+        marked = 0
+        for observation in observations:
+            try:
+                if observation.path is None:
+                    continue
+                overlay = annotate_arrow_routes(
+                    observation.image,
+                    list(observation.routes),
+                    list(observation.markers),
+                )
+                annotated = observation.path.with_name(
+                    observation.path.stem + "_annotated_frame.png"
+                )
+                if cv2.imwrite(str(annotated), overlay):
+                    marked += 1
+                else:
+                    logger.log("annotate_failed", photo=str(annotated))
+            except Exception as exc:  # noqa: BLE001 - annotation is a bonus
+                logger.log(
+                    "annotate_error",
+                    photo=str(observation.path),
+                    error=str(exc),
+                )
+        _notice(f"Размечено исходных кадров: {marked}")
+
     if second is None:
         _notice("Маршрутов меньше двух — второй по длине не определён")
-        return
-    _notice(
-        f"2-й маршрут {second.start_marker_id}->{second.end_marker_id}: "
-        f"стрелок {len(second.arrows)}, {second.length_px:.0f} px"
-    )
+    else:
+        _notice(
+            f"2-й по длине: {second.start_marker_id}->{second.end_marker_id}, "
+            f"стрелок {len(second.arrows)}, {second.length_px:.0f} px"
+        )
 
 
 _QUADRANT_SIGNS = {
@@ -373,6 +549,7 @@ def main(argv: list[str] | None = None) -> int:
             move_tolerance_m=args.move_tolerance,
             tolerance_m=args.tolerance,
             settle_s=args.settle,
+            stop_count=args.stops,
             tilt_settle_s=args.tilt_settle,
             landing_height_m=args.landing_height,
             photo_retries=args.photo_retries,
@@ -423,8 +600,10 @@ def main(argv: list[str] | None = None) -> int:
         result = run_photo_mission(
             link, config, logger, args.photo_dir, notice=_notice
         )
-        if result.ok and result.photo is not None:
-            _report_routes(result.photo, logger)
+        if result.photos:
+            _analyse_photos(
+                result.photos, logger, annotate_all=args.annotate_all
+            )
     except KeyboardInterrupt:
         logger.log("interrupted")
         print("Прервано оператором", file=sys.stderr)

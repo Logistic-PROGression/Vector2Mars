@@ -60,6 +60,7 @@ class FakeLink:
         self.land_calls = 0
         self.photo_calls = 0
         self.photos: list[Path] = []
+        self.photo_positions: list[tuple[float, float]] = []
         self.camera_error = None
         self._last = clock.now
 
@@ -116,6 +117,7 @@ class FakeLink:
             return None
         path = Path(directory) / f"photo_{self.photo_calls}.jpg"
         self.photos.append(path)
+        self.photo_positions.append((self.x, self.y))
         return path
 
 
@@ -154,7 +156,9 @@ class PhotoMissionTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertIsNotNone(result.photo)
         self.assertTrue(result.photo.name.endswith(".jpg"))
-        self.assertEqual(result.photo_attempts, 1)
+        self.assertEqual(len(result.photos), 5)
+        self.assertEqual(result.photo, result.photos[-1])
+        self.assertEqual(result.photo_attempts, 5)
         self.assertAlmostEqual(result.climbed_m, 2.7, delta=0.06)
         self.assertEqual(link.state, "ON_LAND")
         self.assertEqual(link.land_calls, 1)
@@ -163,8 +167,13 @@ class PhotoMissionTests(unittest.TestCase):
         self.assertAlmostEqual(link.angle, -80.0)  # physical -90 → SDK -80
 
         events = _events(records)
+        self.assertEqual(events.count("photo"), 5)
+        self.assertEqual(events.count("stop_start"), 5)
+        self.assertEqual(events.count("stop_done"), 5)
+        self.assertEqual(events.count("move_done"), 4)  # the first stop is takeoff
         start = records[events.index("mission_start")]
         self.assertEqual(start["altitude_m"], 2.7)
+        self.assertEqual(start["stop_count"], 5)
         for expected in (
             "mission_start",
             "ground_reference",
@@ -180,12 +189,28 @@ class PhotoMissionTests(unittest.TestCase):
         ):
             self.assertIn(expected, events)
         self.assertLess(events.index("tilt"), events.index("takeoff"))
-        self.assertLess(events.index("climb_done"), events.index("move_done"))
-        self.assertLess(events.index("move_done"), events.index("photo"))
+        self.assertLess(events.index("climb_done"), events.index("stop_start"))
+        self.assertLess(events.index("stop_done"), events.index("land"))
         self.assertLess(events.index("photo"), events.index("land"))
         final = records[events.index("mission_complete")]
         self.assertTrue(final["ok"])
         self.assertEqual(final["reason"], "")
+
+    def test_five_stops_are_spread_along_the_route(self):
+        config = MissionConfig(
+            altitude_m=1.5,
+            settle_s=0.0,
+            target_x_m=0.5,
+            target_y_m=0.5,
+            move_tolerance_m=0.01,
+        )
+        result, _records, link, _clock = _run(config)
+
+        self.assertEqual(len(result.photos), 5)
+        for (x, y), fraction in zip(link.photo_positions, (0.0, 0.125, 0.25, 0.375, 0.5)):
+            self.assertAlmostEqual(x, fraction, delta=0.05)
+            self.assertAlmostEqual(y, fraction, delta=0.05)
+        self.assertAlmostEqual(link.x, 0.5, delta=0.1)
 
     def test_moves_to_target_with_rotated_yaw(self):
         config = MissionConfig(
@@ -217,7 +242,11 @@ class PhotoMissionTests(unittest.TestCase):
 
     def test_photo_retries_exhaust_and_drone_still_lands(self):
         config = MissionConfig(
-            altitude_m=1.5, settle_s=0.0, photo_retries=3, photo_delay_s=0.2
+            altitude_m=1.5,
+            settle_s=0.0,
+            stop_count=1,
+            photo_retries=3,
+            photo_delay_s=0.2,
         )
         result, records, link, _clock = _run(config, photo_failures=3)
 
@@ -276,6 +305,8 @@ class MissionConfigTests(unittest.TestCase):
     def test_rejects_bad_retries_and_landing_height(self):
         with self.assertRaises(ValueError):
             MissionConfig(photo_retries=0)
+        with self.assertRaises(ValueError):
+            MissionConfig(stop_count=0)
         with self.assertRaises(ValueError):
             MissionConfig(altitude_m=2.7, landing_height_m=3.0)
 
