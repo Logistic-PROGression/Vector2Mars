@@ -49,8 +49,8 @@ class MissionConfig:
 
     altitude_m: float = 2.7
     max_altitude_m: float = 3.0
-    target_x_m: float = 1.3
-    target_y_m: float = 1.3
+    target_x_m: float = 0.5
+    target_y_m: float = 0.5
     tilt_deg: float = -90.0
     servo_zero_deg: float = 30.0
     servo_down_deg: float = -80.0

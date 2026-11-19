@@ -158,8 +158,8 @@ class PhotoMissionTests(unittest.TestCase):
         self.assertAlmostEqual(result.climbed_m, 2.7, delta=0.06)
         self.assertEqual(link.state, "ON_LAND")
         self.assertEqual(link.land_calls, 1)
-        self.assertAlmostEqual(link.x, 1.3, delta=0.1)
-        self.assertAlmostEqual(link.y, 1.3, delta=0.1)
+        self.assertAlmostEqual(link.x, 0.5, delta=0.1)
+        self.assertAlmostEqual(link.y, 0.5, delta=0.1)
         self.assertAlmostEqual(link.angle, -80.0)  # physical -90 → SDK -80
 
         events = _events(records)
