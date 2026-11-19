@@ -23,6 +23,8 @@
   python3 photo_mission.py --local                    # на борту, камера вниз
   python3 photo_mission.py --local --altitude 3.0     # другая высота
   python3 photo_mission.py --local --target-x 1.0 --target-y 1.0
+  python3 photo_mission.py --local --quadrant sw      # лететь в −x −y
+  python3 photo_mission.py --local --quadrant se --target-x 1.0 --target-y 1.0
   python3 photo_mission.py --local --tilt -60         # снимать не строго вниз
 
 Коды возврата: 0 — миссия и фото успешны; 1 — ошибка миссии или нет фото;
@@ -52,6 +54,9 @@ from mars.mission import MissionConfig, run_photo_mission
 #   --max-altitude 3.0      защита: запрещает задать высоту выше этого предела
 #   --target-x 1.3          куда лететь от точки взлёта по x, м
 #   --target-y 1.3          куда лететь от точки взлёта по y, м
+#   --quadrant auto         направление полёта: auto|ne|nw|se|sw
+#                           (ne=+x+y, nw=-x+y, se=+x-y, sw=-x-y;
+#                            auto — знаки берутся из --target-x/--target-y)
 #   --tilt -90              физический угол камеры: -90 вниз, 0 горизонт
 #   --servo-zero 30         угол SDK, при котором камера смотрит в горизонт
 #   --servo-down -80        угол SDK, при котором камера смотрит вниз
@@ -112,6 +117,15 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=defaults.target_y_m,
         metavar="М",
         help="куда лететь от точки взлёта по y",
+    )
+    parser.add_argument(
+        "--quadrant",
+        choices=("auto", "ne", "nw", "se", "sw"),
+        default="auto",
+        help=(
+            "направление полёта: ne=+x+y, nw=-x+y, se=+x-y, sw=-x-y; "
+            "auto — знаки берутся из --target-x/--target-y"
+        ),
     )
     parser.add_argument(
         "--tilt",
@@ -273,14 +287,34 @@ def _notice(text: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {text}", flush=True)
 
 
+_QUADRANT_SIGNS = {
+    "ne": (1, 1),
+    "nw": (-1, 1),
+    "se": (1, -1),
+    "sw": (-1, -1),
+}
+
+
+def _target_with_quadrant(args: argparse.Namespace) -> tuple[float, float]:
+    """Return target x/y with the sign selected by ``--quadrant``.
+
+    ``auto`` keeps the signs of ``--target-x``/``--target-y`` untouched.
+    """
+    if args.quadrant == "auto":
+        return args.target_x, args.target_y
+    sign_x, sign_y = _QUADRANT_SIGNS[args.quadrant]
+    return abs(args.target_x) * sign_x, abs(args.target_y) * sign_y
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    target_x, target_y = _target_with_quadrant(args)
     try:
         config = MissionConfig(
             altitude_m=args.altitude,
             max_altitude_m=args.max_altitude,
-            target_x_m=args.target_x,
-            target_y_m=args.target_y,
+            target_x_m=target_x,
+            target_y_m=target_y,
             tilt_deg=args.tilt,
             servo_zero_deg=args.servo_zero,
             servo_down_deg=args.servo_down,
