@@ -111,13 +111,25 @@ class DroneLink:
             self._open_camera(pioneer_sdk2)
 
     def _open_camera(self, sdk) -> None:
+        # On board the SDK uses the local GStreamer driver, whose Camera()
+        # accepts no camera_ip; the laptop wheel uses RTSP and needs it.
+        driver = None
         try:
-            if self.local:
+            driver = sdk.CONFIG["cameras"]["driver"]
+        except Exception:
+            pass
+        use_local_driver = self.local or driver == "gstreamer"
+        try:
+            if use_local_driver:
                 self._camera = sdk.Camera(camera_type=sdk.CameraType.MAIN)
             else:
-                self._camera = sdk.Camera(
-                    camera_type=sdk.CameraType.MAIN, camera_ip=self.camera_ip
-                )
+                try:
+                    self._camera = sdk.Camera(
+                        camera_type=sdk.CameraType.MAIN, camera_ip=self.camera_ip
+                    )
+                except TypeError:  # board build without camera_ip support
+                    self._camera = sdk.Camera(camera_type=sdk.CameraType.MAIN)
+            self._camera_error = None
         except Exception as exc:  # camera is optional: teleop still works
             self._camera = None
             self._camera_error = str(exc)
@@ -243,6 +255,11 @@ class DroneLink:
             return None
         try:
             frame = self._camera.get_cv_frame(timeout=timeout)
+        except TypeError:  # some board builds expose get_cv_frame() only
+            try:
+                frame = self._camera.get_cv_frame()
+            except Exception:
+                return None
         except Exception:
             return None
         if frame is None or getattr(frame, "size", 0) == 0:

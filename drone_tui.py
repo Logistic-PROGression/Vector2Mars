@@ -102,7 +102,10 @@ class Tui:
         except curses.error:
             pass
         self._init_colors()
-        self._note("TUI запущен")
+        if self.link.camera_error:
+            self._note("Камера недоступна: " + self.link.camera_error)
+        else:
+            self._note("TUI запущен")
         self.logger.log("tui_started", dry_run=self.args.dry_run, local=self.args.local)
         try:
             while self.running:
@@ -209,8 +212,11 @@ class Tui:
             self._note(f"Фото не сохранено: {exc}")
             return
         if path is None:
-            self.logger.log("photo_failed")
-            self._note("Кадр не получен")
+            self.logger.log("photo_failed", camera_error=self.link.camera_error)
+            if self.link.camera_error:
+                self._note("Камера недоступна: " + self.link.camera_error)
+            else:
+                self._note("Кадр не получен: проверьте камеру и поток")
             return
         self.logger.log("photo", path=str(path))
         self._note(f"Фото: {path}")
