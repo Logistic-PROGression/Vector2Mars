@@ -67,7 +67,7 @@ python3 decode_jpeg.py samples/map_Rx.txt samples/image.jpg
 | `mars/teleop.py` | клавиши → скорости, затухание импульса |
 | `mars/flightlog.py` | JSONL-журнал полёта |
 | `drone_tui.py` | curses-пульт: полёт, камера, журнал |
-| `mars/mission.py` | `MissionConfig`, `run_photo_mission`: камера вниз → взлёт → фото → посадка |
+| `mars/mission.py` | `MissionConfig`, `run_photo_mission`: камера вниз → взлёт → высота → перелёт в точку → фото → посадка |
 | `photo_mission.py` | CLI авто-миссии; все флаги и значения по умолчанию — в шапке файла |
 | `config/routes.json` | палитра HSV, `px_per_meter`, `min_area_px`, флаг `dangerous` |
 | `tests/` | unittest, без железа |
@@ -117,13 +117,15 @@ python3 drone_tui.py --local                   # на борту
 
 ```bash
 python3 photo_mission.py --dry-run                # последовательность без железа
-python3 photo_mission.py --local                  # камера вниз, 2.7 м, фото, посадка
+python3 photo_mission.py --local                  # вниз, 2.7 м, точка (1.3, 1.3), фото, посадка
 python3 photo_mission.py --local --altitude 3.0   # ключевой параметр — высота
+python3 photo_mission.py --local --target-x 1.0 --target-y 1.0
 ```
 
-- Последовательность: наклон камеры `--tilt` (по умолчанию −90°), взлёт, набор `--altitude` над точкой взлёта закрытым контуром по LPS (fallback — барометр), пауза `--settle`, фото с повторами, снижение до `--landing-height` и полная посадка.
+- Последовательность: наклон камеры `--tilt` (по умолчанию −90°), взлёт, набор `--altitude` над точкой взлёта закрытым контуром по LPS (fallback — барометр), перелёт в `--target-x`/`--target-y` (по умолчанию 1.3/1.3 м от точки взлёта) с удержанием высоты, пауза `--settle`, фото с повторами, снижение до `--landing-height` и полная посадка в этой точке.
+- Перелёт тоже закрытый контур по LPS: координаты точки взлёта запоминаются после взлёта, тело-фиксированные скорости поворачиваются на текущий yaw; допуск `--move-tolerance`, скорость `--move-speed`, таймаут `--move-timeout`.
 - Наклон сервопривода доступен только в `--local`; без него скрипт предупреждает, пишет `tilt_unavailable` в журнал и продолжает миссию.
-- Наклон удерживается повтором раз в секунду. Шаги (`mission_start`, `climb_progress`, `photo`, `descent_done`, `land`, `mission_complete`) и ошибки — в `logs/flight_*.jsonl`.
+- Наклон удерживается повтором раз в секунду. Шаги (`mission_start`, `takeoff_reference`, `climb_progress`, `move_progress`, `move_done`, `photo`, `descent_done`, `land`, `mission_complete`) и ошибки — в `logs/flight_*.jsonl`.
 - Ошибка или Ctrl+C → аварийная посадка, код возврата 1/130; нет связи — 2. Полный список флагов прокомментирован в шапке `photo_mission.py`.
 
 ### Сеть дрона — читать перед подключением

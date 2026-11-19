@@ -1,7 +1,8 @@
 """Automated photo mission on top of :class:`mars.drone.DroneLink`.
 
 Sequence: tilt the camera straight down, take off, climb to a target height
-above the takeoff point, settle, take a photo, descend and land.
+above the takeoff point, fly to a target point relative to the takeoff point,
+settle, take a photo, descend and land.
 
 The module has no curses and no CLI. It is one synchronous function so the
 whole sequence can be exercised against ``SimulatedLink`` or a fake link with
@@ -12,6 +13,7 @@ errors go to :class:`mars.flightlog.FlightLogger`.
 from __future__ import annotations
 
 import dataclasses
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +29,10 @@ TILT_HOLD_S = 1.0
 # speed the error decays over roughly a second, which is gentle for a small
 # airframe.
 ALTITUDE_GAIN = 0.8
+# Proportional gain of the horizontal position controller, 1/s. The speed is
+# capped by ``move_speed_ms``, so the drone slows down near the target instead
+# of overshooting it.
+HORIZONTAL_GAIN = 0.8
 
 
 class MissionError(RuntimeError):
@@ -43,12 +49,16 @@ class MissionConfig:
 
     altitude_m: float = 2.7
     max_altitude_m: float = 3.0
+    target_x_m: float = 1.3
+    target_y_m: float = 1.3
     tilt_deg: float = -90.0
     servo_zero_deg: float = 30.0
     servo_down_deg: float = -80.0
     servo_priority: str = "high"
     climb_speed_ms: float = 0.35
     descend_speed_ms: float = 0.4
+    move_speed_ms: float = 0.4
+    move_tolerance_m: float = 0.08
     tolerance_m: float = 0.05
     settle_s: float = 1.5
     tilt_settle_s: float = 1.0
@@ -57,6 +67,7 @@ class MissionConfig:
     photo_delay_s: float = 0.7
     climb_timeout_s: float = 60.0
     descend_timeout_s: float = 60.0
+    move_timeout_s: float = 60.0
 
     def __post_init__(self) -> None:
         if self.altitude_m <= 0:
@@ -68,17 +79,25 @@ class MissionConfig:
             )
         if not -90.0 <= self.tilt_deg <= 0.0:
             raise ValueError("наклон камеры должен быть в диапазоне -90…0°")
+        if not (math.isfinite(self.target_x_m) and math.isfinite(self.target_y_m)):
+            raise ValueError("координаты цели должны быть числами")
         if self.climb_speed_ms <= 0 or self.descend_speed_ms <= 0:
             raise ValueError("скорости набора и снижения должны быть больше 0")
-        if self.tolerance_m <= 0:
-            raise ValueError("допуск по высоте должен быть больше 0")
+        if self.move_speed_ms <= 0:
+            raise ValueError("горизонтальная скорость должна быть больше 0")
+        if self.tolerance_m <= 0 or self.move_tolerance_m <= 0:
+            raise ValueError("допуски по высоте и горизонтали должны быть больше 0")
         if not 0.0 <= self.landing_height_m < self.altitude_m:
             raise ValueError("высота начала посадки должна быть меньше высоты миссии")
         if self.settle_s < 0 or self.tilt_settle_s < 0:
             raise ValueError("паузы не могут быть отрицательными")
         if self.photo_retries < 1:
             raise ValueError("нужна хотя бы одна попытка фото")
-        if self.climb_timeout_s <= 0 or self.descend_timeout_s <= 0:
+        if (
+            self.climb_timeout_s <= 0
+            or self.descend_timeout_s <= 0
+            or self.move_timeout_s <= 0
+        ):
             raise ValueError("таймауты должны быть больше 0")
         if self.servo_priority not in ("low", "medium", "high"):
             raise ValueError("приоритет сервопривода: low, medium или high")
@@ -200,6 +219,40 @@ def _read_baseline(
     raise MissionError("нет телеметрии высоты (LPS/альтиметр): миссия отменена")
 
 
+def _read_takeoff_position(
+    link: DroneLink,
+    logger: FlightLogger,
+    sleep: Callable[[float], None],
+) -> tuple[float, float, float]:
+    """Return the LPS point where the drone took off.
+
+    The LPS origin may be reset during takeoff, so the first samples can still
+    belong to the old frame. Reading several times and keeping the last one
+    gives the coordinates the mission should treat as "from the start".
+    """
+    point: tuple[float, float, float] | None = None
+    for _ in range(5):
+        telemetry = _safe_telemetry(link, logger)
+        if telemetry.position is not None:
+            point = (
+                float(telemetry.position[0]),
+                float(telemetry.position[1]),
+                float(telemetry.position[2]),
+            )
+            sleep(0.2)
+
+    if point is None:
+        raise MissionError("нет LPS-координат после взлёта: миссия отменена")
+
+    logger.log(
+        "takeoff_reference",
+        x=round(point[0], 2),
+        y=round(point[1], 2),
+        z=round(point[2], 2),
+    )
+    return point
+
+
 def _climb(
     link: DroneLink,
     config: MissionConfig,
@@ -249,6 +302,100 @@ def _climb(
                 height_m=round(height, 2),
                 target_m=config.altitude_m,
                 vz=round(vz, 2),
+            )
+        sleep(LOOP_S)
+
+
+def _move_to_target(
+    link: DroneLink,
+    config: MissionConfig,
+    baseline: Telemetry,
+    takeoff_point: tuple[float, float, float],
+    logger: FlightLogger,
+    notice: Callable[[str], None],
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+    tilt: _TiltHold,
+) -> None:
+    """Fly horizontally to ``target_x_m``/``target_y_m`` from the takeoff point.
+
+    The target is expressed in the LPS frame, while ``set_velocity`` is
+    body-fixed, so the world-frame velocity is rotated by the current yaw. The
+    altitude is held with the same proportional controller as the climb.
+    """
+    target_x = takeoff_point[0] + config.target_x_m
+    target_y = takeoff_point[1] + config.target_y_m
+    started = clock()
+    last_log = started
+    notice(
+        f"Полёт к точке x={config.target_x_m:.2f}, y={config.target_y_m:.2f} м "
+        "от взлёта…"
+    )
+
+    while True:
+        telemetry = _safe_telemetry(link, logger)
+        if telemetry.position is None:
+            raise MissionError("нет LPS-координат: горизонтальный полёт остановлен")
+
+        dx = target_x - float(telemetry.position[0])
+        dy = target_y - float(telemetry.position[1])
+        distance = math.hypot(dx, dy)
+
+        if distance <= config.move_tolerance_m:
+            link.set_velocity(0.0, 0.0, 0.0, 0.0, interval=0.2)
+            elapsed = clock() - started
+            logger.log(
+                "move_done",
+                x=round(float(telemetry.position[0]), 2),
+                y=round(float(telemetry.position[1]), 2),
+                target_x=round(target_x, 2),
+                target_y=round(target_y, 2),
+                error_m=round(distance, 2),
+                elapsed_s=round(elapsed, 1),
+            )
+            notice(
+                f"Точка достигнута: x={telemetry.position[0]:.2f}, "
+                f"y={telemetry.position[1]:.2f} м за {elapsed:.1f} с"
+            )
+            return
+
+        if clock() - started > config.move_timeout_s:
+            raise MissionError(
+                f"точка x={target_x:.2f}, y={target_y:.2f} м не достигнута за "
+                f"{config.move_timeout_s:.0f} с (ошибка {distance:.2f} м)"
+            )
+
+        height = height_above_ground(telemetry, baseline)
+        if height is None:
+            raise MissionError("нет данных о высоте: горизонтальный полёт остановлен")
+        altitude_error = config.altitude_m - height
+        vertical_limit = (
+            config.climb_speed_ms if altitude_error >= 0 else config.descend_speed_ms
+        )
+        vz = max(
+            -vertical_limit,
+            min(vertical_limit, altitude_error * ALTITUDE_GAIN),
+        )
+
+        speed = min(config.move_speed_ms, distance * HORIZONTAL_GAIN)
+        world_vx = speed * dx / distance
+        world_vy = speed * dy / distance
+        yaw = math.radians(telemetry.yaw_deg or 0.0)
+        body_vx = world_vx * math.cos(yaw) + world_vy * math.sin(yaw)
+        body_vy = -world_vx * math.sin(yaw) + world_vy * math.cos(yaw)
+        link.set_velocity(body_vx, body_vy, vz, 0.0, interval=0.2)
+        tilt.hold(clock)
+
+        if clock() - last_log >= TELEMETRY_LOG_S:
+            last_log = clock()
+            logger.log(
+                "move_progress",
+                x=round(float(telemetry.position[0]), 2),
+                y=round(float(telemetry.position[1]), 2),
+                error_m=round(distance, 2),
+                vx=round(body_vx, 2),
+                vy=round(body_vy, 2),
+                height_m=round(height, 2),
             )
         sleep(LOOP_S)
 
@@ -407,6 +554,7 @@ def run_photo_mission(
     )
     notice(
         f"Миссия: камера {config.tilt_deg:.0f}°, высота {config.altitude_m:.2f} м, "
+        f"точка ({config.target_x_m:.2f}, {config.target_y_m:.2f}) м от взлёта, "
         "фото, посадка"
     )
 
@@ -438,6 +586,7 @@ def run_photo_mission(
             raise MissionError("взлёт не подтверждён бортом")
         airborne = True
         notice("Взлёт выполнен")
+        takeoff_point = _read_takeoff_position(link, logger, sleep)
 
         # 3. Climb to the requested height above the takeoff point.
         notice(f"Набор высоты до {config.altitude_m:.2f} м…")
@@ -445,17 +594,30 @@ def run_photo_mission(
             link, config, baseline, logger, notice, clock, sleep, tilt
         )
 
-        # 4. Wait for the airframe and the frame to settle.
+        # 4. Fly to the requested point above the field.
+        _move_to_target(
+            link,
+            config,
+            baseline,
+            takeoff_point,
+            logger,
+            notice,
+            clock,
+            sleep,
+            tilt,
+        )
+
+        # 5. Wait for the airframe and the frame to settle.
         _settle(link, config, tilt, clock, sleep)
 
-        # 5. Photo.
+        # 6. Photo.
         result.photo, result.photo_attempts = _take_photo(
             link, config, logger, photo_dir, notice, clock, sleep, tilt
         )
         if result.photo is None:
             result.reason = "фото не получено"
 
-        # 6. Descend under control, then land.
+        # 7. Descend under control, then land.
         _descend(link, config, baseline, logger, notice, clock, sleep, tilt)
         _land(link, logger, notice)
         airborne = False

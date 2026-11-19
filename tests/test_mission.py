@@ -1,6 +1,7 @@
 """Tests for the automated photo mission, driven by a virtual clock."""
 
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -37,15 +38,23 @@ class FakeLink:
         photo_failures: int = 0,
         tilt_error: Exception | None = None,
         can_move: bool = True,
+        can_translate: bool = True,
         interrupt_on_velocity: bool = False,
+        yaw_deg: float = 0.0,
     ) -> None:
         self.clock = clock
         self.photo_failures = photo_failures
         self.tilt_error = tilt_error
         self.can_move = can_move
+        self.can_translate = can_translate
         self.interrupt_on_velocity = interrupt_on_velocity
+        self.yaw_deg = yaw_deg
         self.state = "ON_LAND"
+        self.x = 0.0
+        self.y = 0.0
         self.z = 0.0
+        self.vx = 0.0
+        self.vy = 0.0
         self.vz = 0.0
         self.angle = None
         self.land_calls = 0
@@ -60,12 +69,16 @@ class FakeLink:
         self._last = now
         if self.can_move:
             self.z = max(0.0, self.z + self.vz * dt)
+            if self.can_translate:
+                yaw = math.radians(self.yaw_deg)
+                self.x += (self.vx * math.cos(yaw) - self.vy * math.sin(yaw)) * dt
+                self.y += (self.vx * math.sin(yaw) + self.vy * math.cos(yaw)) * dt
         return Telemetry(
             state=self.state,
             battery_v=8.2,
-            position=(0.0, 0.0, self.z),
+            position=(self.x, self.y, self.z),
             altitude_m=self.z,
-            yaw_deg=0.0,
+            yaw_deg=self.yaw_deg,
         )
 
     def takeoff(self) -> bool:
@@ -77,16 +90,18 @@ class FakeLink:
     def land(self) -> bool:
         self.state = "ON_LAND"
         self.z = 0.0
-        self.vz = 0.0
+        self.vx = self.vy = self.vz = 0.0
         self.land_calls += 1
         return True
 
     def stop(self) -> None:
-        self.vz = 0.0
+        self.vx = self.vy = self.vz = 0.0
 
     def set_velocity(self, vx, vy, vz, yaw_rate_deg, interval=0.2) -> None:
         if self.interrupt_on_velocity:
             raise KeyboardInterrupt
+        self.vx = float(vx)
+        self.vy = float(vy)
         self.vz = float(vz)
 
     def set_camera_angle(self, angle, priority="high", attempts=3) -> bool:
@@ -143,6 +158,8 @@ class PhotoMissionTests(unittest.TestCase):
         self.assertAlmostEqual(result.climbed_m, 2.7, delta=0.06)
         self.assertEqual(link.state, "ON_LAND")
         self.assertEqual(link.land_calls, 1)
+        self.assertAlmostEqual(link.x, 1.3, delta=0.1)
+        self.assertAlmostEqual(link.y, 1.3, delta=0.1)
         self.assertAlmostEqual(link.angle, -80.0)  # physical -90 → SDK -80
 
         events = _events(records)
@@ -153,7 +170,9 @@ class PhotoMissionTests(unittest.TestCase):
             "ground_reference",
             "tilt",
             "takeoff",
+            "takeoff_reference",
             "climb_done",
+            "move_done",
             "photo",
             "descent_done",
             "land",
@@ -161,10 +180,40 @@ class PhotoMissionTests(unittest.TestCase):
         ):
             self.assertIn(expected, events)
         self.assertLess(events.index("tilt"), events.index("takeoff"))
+        self.assertLess(events.index("climb_done"), events.index("move_done"))
+        self.assertLess(events.index("move_done"), events.index("photo"))
         self.assertLess(events.index("photo"), events.index("land"))
         final = records[events.index("mission_complete")]
         self.assertTrue(final["ok"])
         self.assertEqual(final["reason"], "")
+
+    def test_moves_to_target_with_rotated_yaw(self):
+        config = MissionConfig(
+            altitude_m=1.5,
+            settle_s=0.0,
+            target_x_m=1.0,
+            target_y_m=0.5,
+        )
+        result, records, link, _clock = _run(config, yaw_deg=90.0)
+
+        self.assertTrue(result.ok)
+        self.assertAlmostEqual(link.x, 1.0, delta=0.1)
+        self.assertAlmostEqual(link.y, 0.5, delta=0.1)
+        self.assertIn("move_done", _events(records))
+
+    def test_move_timeout_lands_automatically(self):
+        config = MissionConfig(
+            altitude_m=1.5,
+            settle_s=0.0,
+            move_timeout_s=1.0,
+        )
+        result, records, link, _clock = _run(config, can_translate=False)
+
+        self.assertFalse(result.ok)
+        self.assertIn("не достигнута", result.reason)
+        self.assertEqual(link.state, "ON_LAND")
+        self.assertEqual(link.land_calls, 1)
+        self.assertIn("auto_land", _events(records))
 
     def test_photo_retries_exhaust_and_drone_still_lands(self):
         config = MissionConfig(
@@ -229,6 +278,16 @@ class MissionConfigTests(unittest.TestCase):
             MissionConfig(photo_retries=0)
         with self.assertRaises(ValueError):
             MissionConfig(altitude_m=2.7, landing_height_m=3.0)
+
+    def test_rejects_bad_move_settings(self):
+        with self.assertRaises(ValueError):
+            MissionConfig(move_speed_ms=0)
+        with self.assertRaises(ValueError):
+            MissionConfig(move_tolerance_m=0)
+        with self.assertRaises(ValueError):
+            MissionConfig(move_timeout_s=0)
+        with self.assertRaises(ValueError):
+            MissionConfig(target_x_m=float("nan"))
 
 
 class HeightTests(unittest.TestCase):

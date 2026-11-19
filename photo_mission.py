@@ -5,9 +5,10 @@
   1. камера переводится вниз (по умолчанию -90°, максимально вниз);
   2. дрон взлетает;
   3. набор высоты над точкой взлёта (по умолчанию 2.7 м);
-  4. пауза на стабилизацию;
-  5. фото в --photo-dir;
-  6. снижение и полная посадка.
+  4. перелёт в точку (по умолчанию 1.3, 1.3 м от точки взлёта);
+  5. пауза на стабилизацию;
+  6. фото в --photo-dir;
+  7. снижение и полная посадка в этой точке.
 
 Наклон сервопривода работает только на борту (Unix-сокет /tmp/servo.sock),
 поэтому для наклона камеры запускайте с --local. С ноутбука миссия всё равно
@@ -21,6 +22,7 @@
   python3 photo_mission.py --dry-run                  # проверка без железа
   python3 photo_mission.py --local                    # на борту, камера вниз
   python3 photo_mission.py --local --altitude 3.0     # другая высота
+  python3 photo_mission.py --local --target-x 1.0 --target-y 1.0
   python3 photo_mission.py --local --tilt -60         # снимать не строго вниз
 
 Коды возврата: 0 — миссия и фото успешны; 1 — ошибка миссии или нет фото;
@@ -48,12 +50,17 @@ from mars.mission import MissionConfig, run_photo_mission
 #
 #   --altitude 2.7          высота над точкой взлёта, м — главный параметр
 #   --max-altitude 3.0      защита: запрещает задать высоту выше этого предела
+#   --target-x 1.3          куда лететь от точки взлёта по x, м
+#   --target-y 1.3          куда лететь от точки взлёта по y, м
 #   --tilt -90              физический угол камеры: -90 вниз, 0 горизонт
 #   --servo-zero 30         угол SDK, при котором камера смотрит в горизонт
 #   --servo-down -80        угол SDK, при котором камера смотрит вниз
 #   --servo-priority high   приоритет команд сервопривода: low|medium|high
 #   --climb-speed 0.35      максимальная скорость набора высоты, м/с
 #   --descend-speed 0.4     максимальная скорость снижения, м/с
+#   --move-speed 0.4        максимальная скорость горизонтального перелёта, м/с
+#   --move-tolerance 0.08   допуск по горизонтали, м
+#   --move-timeout 60       предел времени перелёта в точку, с
 #   --tolerance 0.05        допуск по высоте, м (когда считаем цель достигнутой)
 #   --settle 1.5            пауза на стабилизацию перед фото, с
 #   --tilt-settle 1.0       пауза после команды наклона камеры, с
@@ -75,7 +82,7 @@ from mars.mission import MissionConfig, run_photo_mission
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     defaults = MissionConfig()
     parser = argparse.ArgumentParser(
-        description="Фото-миссия: камера вниз, взлёт, фото, посадка.",
+        description="Фото-миссия: камера вниз, взлёт, высота, перелёт в точку, фото, посадка.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -91,6 +98,20 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=defaults.max_altitude_m,
         metavar="М",
         help="защита: максимально допустимая высота миссии",
+    )
+    parser.add_argument(
+        "--target-x",
+        type=float,
+        default=defaults.target_x_m,
+        metavar="М",
+        help="куда лететь от точки взлёта по x",
+    )
+    parser.add_argument(
+        "--target-y",
+        type=float,
+        default=defaults.target_y_m,
+        metavar="М",
+        help="куда лететь от точки взлёта по y",
     )
     parser.add_argument(
         "--tilt",
@@ -132,6 +153,27 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=defaults.descend_speed_ms,
         metavar="М/С",
         help="максимальная скорость снижения",
+    )
+    parser.add_argument(
+        "--move-speed",
+        type=float,
+        default=defaults.move_speed_ms,
+        metavar="М/С",
+        help="максимальная скорость горизонтального перелёта",
+    )
+    parser.add_argument(
+        "--move-tolerance",
+        type=float,
+        default=defaults.move_tolerance_m,
+        metavar="М",
+        help="допуск по горизонтали",
+    )
+    parser.add_argument(
+        "--move-timeout",
+        type=float,
+        default=defaults.move_timeout_s,
+        metavar="С",
+        help="предел времени перелёта в точку",
     )
     parser.add_argument(
         "--tolerance",
@@ -237,12 +279,16 @@ def main(argv: list[str] | None = None) -> int:
         config = MissionConfig(
             altitude_m=args.altitude,
             max_altitude_m=args.max_altitude,
+            target_x_m=args.target_x,
+            target_y_m=args.target_y,
             tilt_deg=args.tilt,
             servo_zero_deg=args.servo_zero,
             servo_down_deg=args.servo_down,
             servo_priority=args.servo_priority,
             climb_speed_ms=args.climb_speed,
             descend_speed_ms=args.descend_speed,
+            move_speed_ms=args.move_speed,
+            move_tolerance_m=args.move_tolerance,
             tolerance_m=args.tolerance,
             settle_s=args.settle,
             tilt_settle_s=args.tilt_settle,
@@ -251,6 +297,7 @@ def main(argv: list[str] | None = None) -> int:
             photo_delay_s=args.photo_delay,
             climb_timeout_s=args.climb_timeout,
             descend_timeout_s=args.descend_timeout,
+            move_timeout_s=args.move_timeout,
         )
     except ValueError as exc:
         print(f"Ошибка параметров: {exc}", file=sys.stderr)
