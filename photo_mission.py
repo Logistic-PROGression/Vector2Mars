@@ -708,7 +708,6 @@ def main(argv: list[str] | None = None) -> int:
     if result.ok:
         _notice(f"Готово. Фото: {result.photo}  Журнал: {logger.path}")
         return 0
-    _notice(f"Миссия не выполнена: {result.reason or 'фото не получено'}")
     _notice(f"Журнал: {logger.path}")
     return 1
 

@@ -505,7 +505,8 @@ def _descend(
                 height_m=round(height, 2),
                 elapsed_s=round(elapsed, 1),
             )
-            notice(f"Снижение: {height:.2f} м, посадка")
+            # The landing phase is reported in the JSONL log only: console
+            # output stops at the last stop of the mission.
             return
 
         if clock() - started > config.descend_timeout_s:
@@ -530,6 +531,7 @@ def _descend(
 
 
 def _land(link: DroneLink, logger: FlightLogger, notice: Callable[[str], None]) -> None:
+    """Land through the board; the console stays silent about the landing."""
     logger.log("land_requested")
     try:
         ok = link.land()
@@ -539,13 +541,15 @@ def _land(link: DroneLink, logger: FlightLogger, notice: Callable[[str], None]) 
     logger.log("land", ok=bool(ok))
     if not ok:
         raise MissionError("посадка не подтверждена бортом")
-    notice("Посадка выполнена")
 
 
 def _safe_land(
     link: DroneLink, logger: FlightLogger, notice: Callable[[str], None]
 ) -> None:
-    """Best-effort landing for error and interrupt paths; never raises."""
+    """Best-effort landing for error and interrupt paths; never raises.
+
+    The outcome goes to the log only; the console says nothing about it.
+    """
     try:
         link.stop()
     except Exception:
@@ -554,10 +558,8 @@ def _safe_land(
         ok = link.land()
     except Exception as exc:
         logger.log("auto_land_failed", error=str(exc))
-        notice(f"Аварийная посадка не подтверждена: {exc}")
         return
     logger.log("auto_land", ok=bool(ok))
-    notice("Посадка выполнена" if ok else "Аварийная посадка не подтверждена")
 
 
 def run_photo_mission(
@@ -679,15 +681,13 @@ def run_photo_mission(
         result.interrupted = True
         result.reason = "прервано оператором"
         logger.log("mission_interrupted")
-        notice("Прервано: аварийная посадка")
+        notice("Прервано")
     except MissionError as exc:
         result.reason = str(exc)
         logger.log("mission_error", error=str(exc))
-        notice(f"Ошибка миссии: {exc}")
     except Exception as exc:  # pragma: no cover - defensive
         result.reason = str(exc)
         logger.log("mission_error", error=str(exc), error_type=type(exc).__name__)
-        notice(f"Ошибка миссии: {exc}")
     finally:
         if airborne:
             _safe_land(link, logger, notice)
