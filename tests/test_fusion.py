@@ -7,9 +7,9 @@ from pathlib import Path
 
 import numpy as np
 
-from mars.arrow_routes import Arrow, routes_from_arrows
+from mars.arrow_routes import Arrow, ArrowRoute, routes_from_arrows
 from mars.aruco import Marker
-from mars.fusion import FrameObservation, fuse_routes
+from mars.fusion import FrameObservation, fuse_routes, select_by_arrow_hint
 
 SIDE = 40.0
 IMAGE = np.zeros((600, 800, 3), dtype=np.uint8)
@@ -81,6 +81,41 @@ def _observation(
         arrows=tuple(arrows),
         routes=tuple(routes),
         sharpness=sharpness,
+    )
+
+
+def _route(start: int, end: int, count: int) -> ArrowRoute:
+    arrows = tuple(
+        Arrow(
+            center=(200.0 + 10.0 * index, 150.0),
+            direction=(1.0, 0.0),
+            area_px=100,
+            length_px=10.0,
+        )
+        for index in range(count)
+    )
+    return ArrowRoute(
+        start_marker_id=start,
+        end_marker_id=end,
+        arrows=arrows,
+        polyline=((200.0, 150.0), (300.0, 150.0)),
+        length_px=float(count * 10),
+    )
+
+
+def _hint_observation(
+    name: str, counts: tuple[int, ...], *, marker_count: int = 4
+) -> FrameObservation:
+    markers = tuple(_markers(0.0, 0.0))[:marker_count]
+    routes = tuple(
+        _route(index % 2, 2 + index % 2, count)
+        for index, count in enumerate(counts)
+    )
+    return FrameObservation(
+        path=Path(name),
+        image=IMAGE,
+        markers=markers,
+        routes=routes,
     )
 
 
@@ -189,6 +224,31 @@ class FusionTest(unittest.TestCase):
         self.assertEqual(fused.mode, "single")
         self.assertEqual(fused.reference.path, Path("good.jpg"))
         self.assertIn("гомография", fused.note)
+
+
+class ArrowHintTest(unittest.TestCase):
+    def test_matching_frame_is_preferred(self) -> None:
+        good = _hint_observation("good.jpg", (13, 8, 3))
+        bad = _hint_observation("bad.jpg", (13, 8, 2))
+
+        selected = select_by_arrow_hint([bad, good], (3, 8, 13))
+
+        self.assertEqual(selected, [good])
+
+    def test_no_match_keeps_every_frame(self) -> None:
+        frames = [
+            _hint_observation("a.jpg", (13, 8, 2)),
+            _hint_observation("b.jpg", (13, 7, 3)),
+        ]
+
+        self.assertEqual(select_by_arrow_hint(frames, (13, 8, 3)), frames)
+
+    def test_frame_without_four_markers_is_not_a_match(self) -> None:
+        clipped = _hint_observation("clipped.jpg", (13, 8, 3), marker_count=3)
+        wrong = _hint_observation("wrong.jpg", (13, 8, 2))
+        frames = [clipped, wrong]
+
+        self.assertEqual(select_by_arrow_hint(frames, (13, 8, 3)), frames)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,14 @@
      каждой позиции (2 из 3, 3 из 5), поэтому потеря одной стрелки на кадре
      не портит счёт; маршруты выводятся по возрастанию длины.
 
+Флаг --expect-arrows тихо оставляет для сшивки только кадры, где набор чисел
+стрелок на маршрутах совпал с ожидаемым (без чисел — 13 8 3). Если совпадений
+нет, анализ идёт как без флага; в консоль ничего дополнительно не печатается.
+
+Флаги можно включить и в самом коде: отредактируйте CODE_DEFAULTS в начале
+файла, например CodeDefaults(annotate_all=True, expect_arrows=(13, 8, 3)).
+Числовые параметры миссии при этом задаются в MissionConfig.
+
 Метки должны быть видны целиком хотя бы на двух кадрах: по четырём центрам
 строится гомография, по углам меток она проверяется. Если сшить кадры нельзя,
 скрипт откатывается на лучший одиночный кадр.
@@ -44,6 +52,7 @@ import argparse
 import sys
 import time
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 
 from mars.drone import (
@@ -56,8 +65,35 @@ from mars.drone import (
 from mars.flightlog import FlightLogger
 from mars.mission import MissionConfig, run_photo_mission
 
+# Arrow counts of the three routes on the competition field. Used only when
+# --expect-arrows is given without numbers.
+DEFAULT_EXPECTED_ARROWS = (13, 8, 3)
+
+
+@dataclass(frozen=True)
+class CodeDefaults:
+    """Flag defaults that can be set in code instead of the command line.
+
+    Change ``CODE_DEFAULTS`` below to enable a mode without arguments, for
+    example ``CodeDefaults(annotate_all=True, expect_arrows=(13, 8, 3))``.
+    Numeric mission parameters stay in :class:`mars.mission.MissionConfig`.
+    """
+
+    local: bool = False
+    no_camera: bool = False
+    dry_run: bool = False
+    annotate_all: bool = False
+    expect_arrows: tuple[int, ...] | None = None
+
+
+# These values are used when the matching flag is absent from the command
+# line. Edit the line below to hardcode an enabled flag.
+CODE_DEFAULTS = CodeDefaults()
+
 # ---------------------------------------------------------------------------
-# Все флаги скрипта (значение по умолчанию в скобках):
+# Все флаги скрипта (значение по умолчанию в скобках).
+# Переключатели можно включить заранее в CODE_DEFAULTS выше:
+#   CODE_DEFAULTS = CodeDefaults(annotate_all=True, expect_arrows=(13, 8, 3))
 #
 #   --altitude 2.7          высота над точкой взлёта, м — главный параметр
 #   --max-altitude 3.0      защита: запрещает задать высоту выше этого предела
@@ -92,7 +128,16 @@ from mars.mission import MissionConfig, run_photo_mission
 #   --photo-dir photos      куда сохранять фото
 #   --log-dir logs          куда писать JSONL-журнал
 #   --annotate-all          разметить не только итоговый, но и все кадры
+#   --expect-arrows         проверить число стрелок на маршрутах
+#                           (без чисел — 13 8 3; без флага проверка выключена)
 # ---------------------------------------------------------------------------
+
+
+def _expected_arrows(values: list[int] | None) -> tuple[int, ...] | None:
+    """Turn the optional flag into a hint; None keeps the check disabled."""
+    if values is None:
+        return None
+    return tuple(values) if values else DEFAULT_EXPECTED_ARROWS
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -279,16 +324,19 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--local",
         action="store_true",
+        default=CODE_DEFAULTS.local,
         help="запуск на борту дрона (нужен для наклона камеры)",
     )
     parser.add_argument(
         "--no-camera",
         action="store_true",
+        default=CODE_DEFAULTS.no_camera,
         help="не подключать камеру (фото тогда не будет)",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
+        default=CODE_DEFAULTS.dry_run,
         help="симуляция без дрона и SDK",
     )
     parser.add_argument(
@@ -304,7 +352,23 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--annotate-all",
         action="store_true",
+        default=CODE_DEFAULTS.annotate_all,
         help="разметить все кадры, а не только итоговый",
+    )
+    parser.add_argument(
+        "--expect-arrows",
+        nargs="*",
+        type=int,
+        default=(
+            None
+            if CODE_DEFAULTS.expect_arrows is None
+            else list(CODE_DEFAULTS.expect_arrows)
+        ),
+        metavar="N",
+        help=(
+            "проверить число стрелок на маршрутах; без чисел — 13 8 3, "
+            "без флага проверка выключена"
+        ),
     )
     return parser.parse_args(argv)
 
@@ -318,6 +382,7 @@ def _analyse_photos(
     logger: FlightLogger,
     *,
     annotate_all: bool = False,
+    expect_arrows: tuple[int, ...] | None = None,
 ) -> None:
     """Mark the stop photos, fuse them and report the routes.
 
@@ -327,6 +392,10 @@ def _analyse_photos(
     an arrow or invented a bright patch cannot change the result. If the
     frames cannot be aligned, the best single frame is used. Routes are
     printed shortest first.
+
+    With ``expect_arrows`` only full-marker frames whose route arrow counts
+    match the expected set are fused. No match keeps every frame, so the
+    report is exactly the same as without the hint.
     """
     try:
         import cv2  # noqa: PLC0415 - optional heavy dependency
@@ -342,7 +411,11 @@ def _analyse_photos(
             routes_from_arrows,
             second_longest_route,
         )
-        from mars.fusion import FrameObservation, fuse_routes  # noqa: PLC0415
+        from mars.fusion import (  # noqa: PLC0415
+            FrameObservation,
+            fuse_routes,
+            select_by_arrow_hint,
+        )
     except Exception as exc:  # noqa: BLE001 - never fail the mission on vision
         logger.log("route_error", error=str(exc))
         _notice(f"Маршруты не посчитаны: {exc}")
@@ -393,6 +466,18 @@ def _analyse_photos(
     if not observations:
         _notice("Кадры не прочитаны — маршруты не посчитаны")
         return
+
+    if expect_arrows is not None:
+        selected = select_by_arrow_hint(observations, expect_arrows)
+        # The hint is intentionally silent in the console; the JSONL log keeps
+        # enough detail to see whether the filter changed anything.
+        logger.log(
+            "arrow_hint",
+            expected=list(expect_arrows),
+            matched=selected is not observations,
+            frames=[str(observation.path) for observation in selected],
+        )
+        observations = selected
 
     fused = fuse_routes(observations)
     reference = fused.reference
@@ -602,7 +687,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         if result.photos:
             _analyse_photos(
-                result.photos, logger, annotate_all=args.annotate_all
+                result.photos,
+                logger,
+                annotate_all=args.annotate_all,
+                expect_arrows=_expected_arrows(args.expect_arrows),
             )
     except KeyboardInterrupt:
         logger.log("interrupted")

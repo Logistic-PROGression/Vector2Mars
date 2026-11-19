@@ -21,10 +21,15 @@ A single frame, a failed homography, or too few confirmed arrows falls back to
 the previous behaviour: report the routes of the best individual frame.
 """
 
+# A hint with the expected arrow counts per route is optional and stays outside
+# the vote: :func:`select_by_arrow_hint` keeps only frames whose counts match
+# and returns the input unchanged when nothing matches.
+
 from __future__ import annotations
 
 import math
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -50,6 +55,10 @@ HOMOGRAPHY_CORNER_UNITS = 0.35
 MIN_HOMOGRAPHY_MARKERS = 4
 
 MIN_FRAMES_FOR_FUSION = 2
+
+# The field map is pinned by four ArUco markers; a frame with fewer of them is
+# clipped and cannot be compared with the expected route counts.
+ARROW_HINT_MARKERS = 4
 
 
 @dataclass(frozen=True)
@@ -174,6 +183,26 @@ def fuse_routes(
         mode="fusion",
         note=f"общих меток: {sorted(marker_ids)}",
     )
+
+
+def select_by_arrow_hint(
+    observations: list[FrameObservation], expected: Sequence[int]
+) -> list[FrameObservation]:
+    """Prefer frames whose route arrow counts match the expected set.
+
+    Only frames with the full marker set take part: with fewer markers the
+    field is clipped and the route count cannot be compared. ``expected`` is
+    order-independent. When no frame matches, the original list is returned
+    unchanged so the caller can report the usual result.
+    """
+    wanted = sorted(expected)
+    matching = [
+        observation
+        for observation in observations
+        if len(observation.markers) == ARROW_HINT_MARKERS
+        and sorted(len(route.arrows) for route in observation.routes) == wanted
+    ]
+    return matching or observations
 
 
 def _choose_group(
