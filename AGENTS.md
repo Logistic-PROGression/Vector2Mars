@@ -67,6 +67,8 @@ python3 decode_jpeg.py samples/map_Rx.txt samples/image.jpg
 | `mars/teleop.py` | клавиши → скорости, затухание импульса |
 | `mars/flightlog.py` | JSONL-журнал полёта |
 | `drone_tui.py` | curses-пульт: полёт, камера, журнал |
+| `mars/mission.py` | `MissionConfig`, `run_photo_mission`: камера вниз → взлёт → фото → посадка |
+| `photo_mission.py` | CLI авто-миссии; все флаги и значения по умолчанию — в шапке файла |
 | `config/routes.json` | палитра HSV, `px_per_meter`, `min_area_px`, флаг `dangerous` |
 | `tests/` | unittest, без железа |
 
@@ -79,6 +81,8 @@ python3 -m mars.aruco samples/image.jpg --marker-size-m 0.15
 python3 -m mars.arrow_routes samples/image.jpg --out samples/image_route.png
 python3 drone_tui.py --dry-run
 python3 drone_tui.py
+python3 photo_mission.py --dry-run
+python3 photo_mission.py --local                     # наклон камеры — только на борту
 python3 -m unittest discover -s tests -v
 ```
 
@@ -108,6 +112,19 @@ python3 drone_tui.py --local                   # на борту
 - `set_angle()` не читает реальный угол: `True` значит лишь «датаграмма ушла в сокет». Пульт шлёт команду с приоритетом `HIGH`, повторяет её и удерживает раз в секунду; диагностика без TUI — `python3 drone_tui.py --local --servo-test`.
 - Углы в пульте физические: `0°` — горизонт, `−90°` — вниз. Шкала SDK сдвинута: горизонт `+30`, вниз `−80`; пересчёт линейный по двум точкам (`ServoScale`), калибровка флагами `--servo-zero` и `--servo-down`. `[`/`]` ведут камеру в крайние положения (вниз/горизонт), а не шагами. Угол уходит на борт **целым** числом: дробный payload борт игнорирует.
 - Журнал `logs/flight_*.jsonl`, фото `photos/` — артефакты, в git не попадают. Подробности: `docs/drone-tui.md`.
+
+### Фото-миссия
+
+```bash
+python3 photo_mission.py --dry-run                # последовательность без железа
+python3 photo_mission.py --local                  # камера вниз, 2.7 м, фото, посадка
+python3 photo_mission.py --local --altitude 3.0   # ключевой параметр — высота
+```
+
+- Последовательность: наклон камеры `--tilt` (по умолчанию −90°), взлёт, набор `--altitude` над точкой взлёта закрытым контуром по LPS (fallback — барометр), пауза `--settle`, фото с повторами, снижение до `--landing-height` и полная посадка.
+- Наклон сервопривода доступен только в `--local`; без него скрипт предупреждает, пишет `tilt_unavailable` в журнал и продолжает миссию.
+- Наклон удерживается повтором раз в секунду. Шаги (`mission_start`, `climb_progress`, `photo`, `descent_done`, `land`, `mission_complete`) и ошибки — в `logs/flight_*.jsonl`.
+- Ошибка или Ctrl+C → аварийная посадка, код возврата 1/130; нет связи — 2. Полный список флагов прокомментирован в шапке `photo_mission.py`.
 
 ### Сеть дрона — читать перед подключением
 
