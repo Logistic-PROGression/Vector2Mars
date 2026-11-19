@@ -1,8 +1,9 @@
 """Thin flight adapter so vision code never imports hardware SDKs.
 
 ``mars.vision`` only consumes frames. All Pioneer SDK 2 usage is confined to
-:class:`PioneerAdapter`, which imports the SDK lazily so the vision pipeline can
-run and be tested offline.
+:class:`PioneerAdapter`, which delegates to :class:`mars.drone.DroneLink` and
+therefore imports the SDK lazily; the vision pipeline still runs and is tested
+offline.
 """
 
 from __future__ import annotations
@@ -12,6 +13,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+
+from mars.drone import DEFAULT_TCP, DroneLink, DroneUnavailable
 
 
 class FlightUnavailable(RuntimeError):
@@ -70,59 +73,41 @@ class SimulatedAdapter(FlightAdapter):
 
 
 class PioneerAdapter(FlightAdapter):
-    """Adapter for Pioneer Mini 2 via Pioneer SDK 2.
+    """Adapter for Pioneer Mini 2 via :class:`mars.drone.DroneLink`."""
 
-    The SDK is imported only in :meth:`connect` so importing this module (and
-    therefore the vision pipeline) works on a laptop without the SDK.
-    """
-
-    def __init__(self) -> None:
-        self._sdk = None
-        self._drone = None
+    def __init__(self, tcp: str = DEFAULT_TCP, local: bool = False) -> None:
+        self.tcp = tcp
+        self.local = local
+        self._link: DroneLink | None = None
 
     def connect(self) -> None:
+        link = DroneLink(tcp=self.tcp, local=self.local)
         try:
-            import pioneer_sdk  # noqa: PLC0415 - lazy import keeps hardware optional
-        except ImportError as exc:
-            raise FlightUnavailable(
-                "pioneer_sdk is not installed; run on the drone or use SimulatedAdapter"
-            ) from exc
-        self._sdk = pioneer_sdk
-        # TODO: verify against Pioneer SDK 2 docs
-        self._drone = pioneer_sdk.Pioneer()
+            link.connect()
+        except DroneUnavailable as exc:
+            raise FlightUnavailable(str(exc)) from exc
+        self._link = link
 
     def takeoff(self, height_m: float) -> None:
-        drone = self._require_drone()
-        # TODO: verify against Pioneer SDK 2 docs (height may need a separate
-        # altitude command before/after takeoff).
-        drone.takeoff()
+        # SDK 2 takeoff() climbs to its configured altitude; height_m is kept
+        # for the mission interface and applied by the caller via goto().
+        self._require().takeoff()
 
     def goto(self, x_m: float, y_m: float, z_m: float) -> None:
-        drone = self._require_drone()
-        # TODO: verify against Pioneer SDK 2 docs
-        drone.go_to_local_point(x=x_m, y=y_m, z=z_m, yaw=0)
+        self._require().goto_local(x_m, y_m, z_m)
 
     def capture_frame(self) -> np.ndarray | None:
-        # TODO: verify against Pioneer SDK 2 docs (camera frame/stream API).
-        raise FlightUnavailable(
-            "camera capture is not verified for PioneerAdapter yet; "
-            "use SimulatedAdapter with saved frames"
-        )
+        return self._require().grab_frame()
 
     def land(self) -> None:
-        drone = self._require_drone()
-        # TODO: verify against Pioneer SDK 2 docs
-        drone.land()
+        self._require().land()
 
     def close(self) -> None:
-        drone = self._drone
-        self._drone = None
-        self._sdk = None
-        if drone is not None:
-            # TODO: verify against Pioneer SDK 2 docs
-            drone.close()
+        link, self._link = self._link, None
+        if link is not None:
+            link.close()
 
-    def _require_drone(self):
-        if self._drone is None:
+    def _require(self) -> DroneLink:
+        if self._link is None:
             raise FlightUnavailable("call connect() before sending flight commands")
-        return self._drone
+        return self._link

@@ -210,3 +210,6 @@ backend/seed_db.py
 
 # `lib/` above targets Python packaging and must not hide frontend sources
 !frontend/src/**/lib/
+
+# Flight TUI artifacts
+photos/

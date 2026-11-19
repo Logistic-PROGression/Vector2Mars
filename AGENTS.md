@@ -62,7 +62,11 @@ python3 decode_jpeg.py samples/map_Rx.txt samples/image.jpg
 | `mars/aruco.py` | `detect_markers`, `annotate_markers`: ArUco id, центр, сторона в px |
 | `mars/scale.py` | `px_per_meter(markers, marker_size_m)` — масштаб по маркеру (B2) |
 | `mars/arrow_routes.py` | `detect_arrow_routes`, `annotate_arrow_routes`: цепочки стрелок между метками (B4) |
-| `mars/flight.py` | `FlightAdapter`, `SimulatedAdapter`, ленивый `PioneerAdapter` |
+| `mars/flight.py` | `FlightAdapter`, `SimulatedAdapter`, `PioneerAdapter` поверх `DroneLink` |
+| `mars/drone.py` | `DroneLink`/`SimulatedLink`: SDK 2, телеметрия, камера, фото |
+| `mars/teleop.py` | клавиши → скорости, затухание импульса |
+| `mars/flightlog.py` | JSONL-журнал полёта |
+| `drone_tui.py` | curses-пульт: полёт, камера, журнал |
 | `config/routes.json` | палитра HSV, `px_per_meter`, `min_area_px`, флаг `dangerous` |
 | `tests/` | unittest, без железа |
 
@@ -73,17 +77,34 @@ python3 main.py --frame samples/frames/frame.jpg --json
 python3 -m mars.aruco samples/image.jpg --out samples/image_markers.png
 python3 -m mars.aruco samples/image.jpg --marker-size-m 0.15
 python3 -m mars.arrow_routes samples/image.jpg --out samples/image_route.png
+python3 drone_tui.py --dry-run
+python3 drone_tui.py
 python3 -m unittest discover -s tests -v
 ```
 
 - Нет кадра/конфига → exit 2 и сообщение на русском, без трейсбека. Пустой кадр, шум, `None` → пустой результат, exit 0.
 - Пока `px_per_meter: null`, длина выводится в пикселях; после калибровки — в метрах.
-- Опасный маршрут сейчас заглушка (синий №3). Реальный назначает спутниковая картинка — перепроверить, когда появятся кадры.
+- Опасный маршрут на поле пока заглушка (синий №3); спутниковая картинка задаёт его парой меток (см. ниже).
 - Длина — по 1-px скелету (морфологический скелет + Zhang-Suen, без `cv2.ximgproc`), диагональные шаги взвешены `sqrt(2)`. Не заменять на `cv2.arcLength` контура: он меряет периметр и завышает длину толстых линий.
 - При появлении кадров: положить в `samples/frames/`, откалибровать `hsv_ranges`, `px_per_meter`, `min_area_px`, уточнить `dangerous`.
 - ArUco на спутниковом снимке `samples/image.jpg`: словарь `DICT_4X4_50`, id 0 и 2. Детектор (`mars/aruco.py`) не падает на `None`/пустом кадре, неизвестный словарь → `ValueError`. Для реальных кадров словарь и `marker_size_m` перепроверить на поле.
 - Опасный маршрут со спутника — цепочка белых стрелок между метками 0 и 2 (3 стрелки, ~140 px), детектор `mars/arrow_routes.py`. Маршрут привязан к паре меток, поэтому несколько маршрутов в кадре не смешиваются; исключать опасный маршрут на поле по этой паре. Пороги масштабируются от стороны маркера.
 - План параллельной работы команды (владение файлами, ветки, фазы): `docs/stage2-plan.md`.
+
+### Пульт (TUI)
+
+```bash
+python3 -m pip install "pioneer-sdk2>=0.11"   # только на ноутбуке, до Wi-Fi дрона
+python3 drone_tui.py --dry-run                 # интерфейс без железа
+python3 drone_tui.py                           # ноутбук в Wi-Fi дрона
+python3 drone_tui.py --local                   # на борту
+```
+
+- Пакет называется `pioneer_sdk2` (не `pioneer_sdk`): `Pioneer(tcp="10.42.0.1:20556")`, RTSP-камера `10.42.0.1:8554`, `Camera(camera_ip=...)`. `Pioneer()` на неудачном TCP вызывает `exit()`, поэтому `DroneLink` ловит `SystemExit` и печатает русское сообщение.
+- Управление — body-fixed скорости (`set_manual_speed_body_fixed`), `yaw_rate` в рад/с. Импульс 0.35 с: отпущенная клавиша обнуляет ось, потеря терминала не оставляет дрон лететь.
+- `X`/`Q` — выход с автоматической посадкой; `--max-altitude` (3 м) блокирует набор высоты.
+- `ServoCamera` ходит через Unix-сокет `/tmp/servo.sock`, поэтому наклон камеры работает только в `--local` на борту; с ноутбука — поток, фото и полёт.
+- Журнал `logs/flight_*.jsonl`, фото `photos/` — артефакты, в git не попадают. Подробности: `docs/drone-tui.md`.
 
 ### Сеть дрона — читать перед подключением
 
