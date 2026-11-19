@@ -1,0 +1,36 @@
+{
+  "px_per_meter": null,
+  "min_area_px": 300,
+  "routes": [
+    {
+      "name": "red",
+      "number": 1,
+      "hsv_ranges": [
+        [[0, 120, 70], [10, 255, 255]],
+        [[170, 120, 70], [180, 255, 255]]
+      ]
+    },
+    {
+      "name": "green",
+      "number": 2,
+      "hsv_ranges": [
+        [[40, 120, 70], [85, 255, 255]]
+      ]
+    },
+    {
+      "name": "blue",
+      "number": 3,
+      "dangerous": true,
+      "hsv_ranges": [
+        [[95, 120, 70], [130, 255, 255]]
+      ]
+    },
+    {
+      "name": "yellow",
+      "number": 4,
+      "hsv_ranges": [
+        [[20, 120, 70], [35, 255, 255]]
+      ]
+    }
+  ]
+}
