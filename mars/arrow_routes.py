@@ -188,6 +188,16 @@ def detect_arrow_routes(
     return routes
 
 
+def second_longest_route(routes: list[ArrowRoute]) -> ArrowRoute | None:
+    """Return the second longest route, or ``None`` when fewer than two exist.
+
+    Task 2 expects the route that is second by length, so routes are ranked
+    here once and the caller does not repeat the ordering.
+    """
+    ordered = sorted(routes, key=lambda route: route.length_px, reverse=True)
+    return ordered[1] if len(ordered) > 1 else None
+
+
 def annotate_arrow_routes(
     image: object, routes: list[ArrowRoute] | None, markers: list[Marker] | None
 ) -> np.ndarray:

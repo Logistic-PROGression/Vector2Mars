@@ -21,6 +21,7 @@ import locale
 import sys
 import time
 from collections import deque
+from pathlib import Path
 
 from mars.drone import (
     DEFAULT_CAMERA,
@@ -275,6 +276,54 @@ class Tui:
             return
         self.logger.log("photo", path=str(path))
         self._note(f"Фото: {path}")
+        self._analyze_photo(path)
+
+    def _analyze_photo(self, path: Path) -> None:
+        """Run the arrow-route detector on a fresh photo and show the 2nd route.
+
+        Task 2 wants the route that is second by length, so every detected
+        route is written to the flight log and the second one is shown in the
+        status line. Vision errors never interrupt the flight.
+        """
+        try:
+            import cv2  # noqa: PLC0415 - optional heavy dependency
+
+            from mars.arrow_routes import (  # noqa: PLC0415
+                detect_arrow_routes,
+                second_longest_route,
+            )
+
+            frame = cv2.imread(str(path))
+            routes = detect_arrow_routes(frame) if frame is not None else []
+            second = second_longest_route(routes)
+        except Exception as exc:  # noqa: BLE001 - never stop the flight
+            self.logger.log("route_error", error=str(exc))
+            self._note(f"Маршруты не посчитаны: {exc}")
+            return
+
+        ranked = sorted(routes, key=lambda route: route.length_px, reverse=True)
+        summary = [
+            {
+                "start": route.start_marker_id,
+                "end": route.end_marker_id,
+                "arrows": len(route.arrows),
+                "length_px": round(route.length_px, 1),
+            }
+            for route in ranked
+        ]
+        self.logger.log(
+            "routes",
+            count=len(routes),
+            second=None if second is None else summary[1],
+            routes=summary,
+        )
+        if second is None:
+            self._note(f"Фото: {path} — маршрутов меньше двух")
+            return
+        self._note(
+            f"2-й маршрут {second.start_marker_id}->{second.end_marker_id}: "
+            f"стрелок {len(second.arrows)}, {second.length_px:.0f} px"
+        )
 
     def _set_tilt(self, target: float) -> None:
         target = self.servo_scale.clamp(target)
