@@ -334,9 +334,9 @@ class DroneLink:
         the board) and repeats the command to survive a dropped datagram.
         """
         angle = max(SERVO_MIN_ANGLE, min(SERVO_MAX_ANGLE, float(angle)))
-        if angle.is_integer():
-            # The board daemon parses "10" more reliably than "10.0".
-            angle = int(angle)
+        # The board daemon accepts whole degrees; a fractional payload such as
+        # "17.77777777777778" is ignored, so round before sending.
+        angle = int(round(angle))
         if self._servo is None:
             try:
                 self._servo = self._sdk.ServoCamera()  # type: ignore[union-attr]

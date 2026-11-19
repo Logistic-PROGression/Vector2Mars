@@ -37,7 +37,6 @@ from mars.teleop import KEY_COMMANDS, KEY_HELP, ControlState, Velocity
 REFRESH_S = 0.1
 TELEMETRY_S = 0.5
 TELEMETRY_LOG_S = 1.0
-SERVO_STEP = 10.0
 EVENT_LINES = 6
 
 
@@ -198,9 +197,9 @@ class Tui:
         elif name in ("p",):
             self._photo()
         elif name == "[":
-            self._tilt(-SERVO_STEP)
+            self._set_tilt(self.servo_scale.physical_min)
         elif name == "]":
-            self._tilt(+SERVO_STEP)
+            self._set_tilt(self.servo_scale.physical_max)
         elif name in ("1", "2", "3", "4"):
             self._set_tilt({"1": -90.0, "2": -60.0, "3": -30.0, "4": 0.0}[name])
         elif name in ("+", "="):
@@ -276,9 +275,6 @@ class Tui:
             return
         self.logger.log("photo", path=str(path))
         self._note(f"Фото: {path}")
-
-    def _tilt(self, delta: float) -> None:
-        self._set_tilt(self.camera_angle + delta)
 
     def _set_tilt(self, target: float) -> None:
         target = self.servo_scale.clamp(target)
