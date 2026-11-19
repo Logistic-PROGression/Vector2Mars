@@ -1,37 +1,37 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Декодер JPEG из лога SDRangel.
+"""Rebuild a JPEG image from an SDRangel receiver log.
 
-Пакет (74 байта): 0-4 заголовок, 5-8 синхрослово, 9-12 смещение
-(little-endian), 13-14 номер файла, 15-68 данные (54 байта), 72-73 CRC.
+Packet layout (74 bytes): header 0-4, sync word 5-8, little-endian file
+offset 9-12, file number 13-14, payload 15-68 (54 bytes), reserved 69-71,
+CRC-16 72-73.
 
-Запуск: python3 decode_jpeg.py [лог] [image.jpg]
+Usage: python3 decode_jpeg.py [log] [output.jpg]
 """
 
 import sys
 from pathlib import Path
 
-SYNC = bytes.fromhex("31 6F 6B 6F")        # метка пакетов с изображением
-DATA_START, DATA_LEN, PKT_LEN = 15, 54, 74
-DEFAULT_LOGS = ["спутник бурмалдутник.txt", "map_Rx.txt", "samples/map_Rx.txt"]
+SYNC = bytes.fromhex("31 6F 6B 6F")  # marks image packets
+DATA_START, DATA_LEN, PACKET_LEN = 15, 54, 74
+DEFAULT_LOGS = ("спутник бурмалдутник.txt", "map_Rx.txt", "samples/map_Rx.txt")
 
 
 def read_chunks(text):
-    """Пары (смещение, данные) из пакетов с CRC OK и верным синхрословом."""
+    """Yield (offset, payload) for every CRC OK packet with a valid sync word."""
     lines = text.splitlines()
     for i, line in enumerate(lines):
         if "CRC OK" not in line:
             continue
-        # пакет — первая непустая строка после вердикта
+        # The packet is the first non-empty line after the verdict.
         hex_line = next((s.strip() for s in lines[i + 1:] if s.strip()), "")
         try:
-            pkt = bytes.fromhex(hex_line)
+            packet = bytes.fromhex(hex_line)
         except ValueError:
             continue
-        if len(pkt) == PKT_LEN and pkt[5:9] == SYNC:
-            offset = int.from_bytes(pkt[9:13], "little")  # младший байт первым
-            yield offset, pkt[DATA_START:DATA_START + DATA_LEN]
+        if len(packet) == PACKET_LEN and packet[5:9] == SYNC:
+            # Little-endian: the least significant byte comes first.
+            offset = int.from_bytes(packet[9:13], "little")
+            yield offset, packet[DATA_START:DATA_START + DATA_LEN]
 
 
 def main():
@@ -40,21 +40,25 @@ def main():
     )
     dst = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("image.jpg")
 
-    buf = bytearray()  # сюда кусочки лягут по своим смещениям
+    buf = bytearray()  # Holds the reassembled file.
     for offset, chunk in read_chunks(src.read_text(encoding="utf-8", errors="replace")):
-        if len(buf) < offset + len(chunk):          # при необходимости растягиваем буфер
+        # Grow the buffer if this chunk extends past its current end.
+        if len(buf) < offset + len(chunk):
             buf.extend(b"\x00" * (offset + len(chunk) - len(buf)))
-        buf[offset:offset + len(chunk)] = chunk     # повторные копии перезаписываются
+        # Duplicate packets simply overwrite the same bytes.
+        buf[offset:offset + len(chunk)] = chunk
 
-    buf[0:2] = b"\xFF\xD8"  # возвращаем затёртый маркер начала JPEG
+    # The transmitter intentionally corrupts the SOI marker. Restore it last,
+    # otherwise the packet at offset 0 would overwrite it again.
+    buf[0:2] = b"\xFF\xD8"
     dst.write_bytes(buf)
-    print(f"{src} -> {dst}: {len(buf)} байт")
+    print(f"{src} -> {dst}: {len(buf)} bytes")
 
-    try:  # необязательная проверка, если установлен Pillow
+    try:  # Optional sanity check when Pillow is available.
         from PIL import Image
-        with Image.open(dst) as im:
-            im.load()
-            print(f"OK: {im.format} {im.width}x{im.height}")
+        with Image.open(dst) as img:
+            img.load()
+            print(f"OK: {img.format} {img.width}x{img.height}")
     except ImportError:
         pass
 
