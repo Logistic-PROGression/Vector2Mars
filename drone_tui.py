@@ -36,7 +36,7 @@ from mars.teleop import KEY_COMMANDS, KEY_HELP, ControlState, Velocity
 REFRESH_S = 0.1
 TELEMETRY_S = 0.5
 TELEMETRY_LOG_S = 1.0
-SERVO_STEP = 5.0
+SERVO_STEP = 10.0
 EVENT_LINES = 6
 
 
@@ -52,6 +52,17 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--speed", type=float, default=0.5, help="скорость, м/с (по умолчанию 0.5)")
     parser.add_argument("--max-speed", type=float, default=1.5, help="предел скорости, м/с")
     parser.add_argument("--max-altitude", type=float, default=3.0, help="защита по высоте, м")
+    parser.add_argument(
+        "--servo-priority",
+        choices=("high", "medium", "low"),
+        default="high",
+        help="приоритет команд сервопривода камеры (по умолчанию high)",
+    )
+    parser.add_argument(
+        "--servo-test",
+        action="store_true",
+        help="прогнать сервопривод -80..30 и выйти (диагностика)",
+    )
     parser.add_argument("--photo-dir", default="photos", help="куда сохранять фото")
     parser.add_argument("--log-dir", default="logs", help="куда писать журнал полёта")
     return parser.parse_args(argv)
@@ -83,6 +94,8 @@ class Tui:
         self.help_visible = False
         self.preview = False
         self.camera_angle = 0.0
+        self.servo_target: float | None = None
+        self._last_servo_send = 0.0
         self.events: deque[str] = deque(maxlen=EVENT_LINES)
         self.message = "Готов. T — взлёт, H — справка."
         self._last_telemetry = 0.0
@@ -168,10 +181,12 @@ class Tui:
             self._land()
         elif name in ("p",):
             self._photo()
-        elif name in ("[",):
+        elif name == "[":
             self._tilt(-SERVO_STEP)
-        elif name in ("]",):
+        elif name == "]":
             self._tilt(+SERVO_STEP)
+        elif name in ("1", "2", "3", "4"):
+            self._set_tilt({"1": -80.0, "2": -40.0, "3": 0.0, "4": 30.0}[name])
         elif name in ("+", "="):
             self._change_speed(+0.1)
         elif name in ("-", "_"):
@@ -247,9 +262,12 @@ class Tui:
         self._note(f"Фото: {path}")
 
     def _tilt(self, delta: float) -> None:
-        target = max(-80.0, min(30.0, self.camera_angle + delta))
+        self._set_tilt(self.camera_angle + delta)
+
+    def _set_tilt(self, target: float) -> None:
+        target = max(-80.0, min(30.0, target))
         try:
-            ok = self.link.set_camera_angle(target)
+            ok = self.link.set_camera_angle(target, priority=self.args.servo_priority)
         except DroneUnavailable as exc:
             self._note(str(exc))
             self.logger.log("tilt_unavailable", error=str(exc))
@@ -259,8 +277,17 @@ class Tui:
             return
         if ok:
             self.camera_angle = target
-            self.logger.log("camera_angle", angle=target)
+            self.servo_target = target
+            self._last_servo_send = time.monotonic()
+            self.logger.log(
+                "camera_angle", angle=target, priority=self.args.servo_priority
+            )
             self._note(f"Камера: {target:.0f}°")
+        else:
+            self.logger.log(
+                "camera_angle_failed", angle=target, priority=self.args.servo_priority
+            )
+            self._note("Сервопривод не подтвердил команду")
 
     def _change_speed(self, delta: float) -> None:
         speed = self.state.change_speed(delta)
@@ -315,6 +342,17 @@ class Tui:
                     vz=round(vz, 2),
                     yaw_rate=round(velocity.yaw_rate, 1),
                 )
+
+        # Hold the commanded tilt: the board may otherwise re-stabilise the
+        # gimbal and silently undo a single manual command.
+        if self.servo_target is not None and now - self._last_servo_send >= 1.0:
+            self._last_servo_send = now
+            try:
+                self.link.set_camera_angle(
+                    self.servo_target, priority=self.args.servo_priority, attempts=1
+                )
+            except Exception:
+                pass
 
         if self.preview:
             frame = self.link.grab_frame(timeout=0.2)
@@ -430,6 +468,21 @@ def _run(screen, link: DroneLink, logger: FlightLogger, args: argparse.Namespace
     Tui(screen, link, logger, args).run()
 
 
+def _servo_test(link: DroneLink, args: argparse.Namespace) -> int:
+    """Sweep the servo so a human can see whether it physically moves."""
+    print("Тест сервопривода: -80 → +30 → 0, шаг 10°.")
+    for angle in [*range(-80, 31, 10), 0]:
+        try:
+            ok = link.set_camera_angle(angle, priority=args.servo_priority)
+        except DroneUnavailable as exc:
+            print(f"Сервопривод недоступен: {exc}")
+            return 2
+        print(f"  {angle:+4d}° — {'команда отправлена' if ok else 'ОШИБКА отправки'}")
+        time.sleep(0.8)
+    print("Если камера не двигалась, проблема не в TUI: проверьте сервопривод и /tmp/servo.sock.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     locale.setlocale(locale.LC_ALL, "")
     args = _parse_args(argv)
@@ -468,6 +521,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     if link.camera_error:
         logger.log("camera_unavailable", error=link.camera_error)
+
+    if args.servo_test:
+        try:
+            return _servo_test(link, args)
+        finally:
+            link.close()
+            logger.close()
 
     try:
         curses.wrapper(_run, link, logger, args)

@@ -283,9 +283,20 @@ class DroneLink:
             return None
         return path
 
-    def set_camera_angle(self, angle: float) -> bool:
-        """Tilt the camera servo. Works only on board (Unix socket)."""
+    def set_camera_angle(
+        self, angle: float, priority: str = "high", attempts: int = 3
+    ) -> bool:
+        """Tilt the camera servo. Works only on board (Unix socket).
+
+        The SDK only confirms that the datagram reached ``/tmp/servo.sock``;
+        there is no angle read-back, so ``True`` does not prove the camera
+        moved. Manual tilt uses HIGH priority (LOW is easily overridden by
+        the board) and repeats the command to survive a dropped datagram.
+        """
         angle = max(SERVO_MIN_ANGLE, min(SERVO_MAX_ANGLE, float(angle)))
+        if angle.is_integer():
+            # The board daemon parses "10" more reliably than "10.0".
+            angle = int(angle)
         if self._servo is None:
             try:
                 self._servo = self._sdk.ServoCamera()  # type: ignore[union-attr]
@@ -294,7 +305,17 @@ class DroneLink:
                     "сервопривод камеры доступен только на борту дрона "
                     "(в удалённом режиме SDK не имеет к нему доступа)"
                 ) from exc
-        return bool(self._servo.set_angle(angle))
+        servo_priority = getattr(
+            self._sdk.ServoPriority,
+            str(priority).upper(),
+            self._sdk.ServoPriority.HIGH,
+        )
+        sent = False
+        for _ in range(max(1, int(attempts))):
+            if self._servo.set_angle(angle, servo_priority):
+                sent = True
+            time.sleep(0.05)
+        return sent
 
     # -- helpers -----------------------------------------------------------
 
@@ -397,6 +418,8 @@ class SimulatedLink(DroneLink):
         self.photos.append(path)
         return path
 
-    def set_camera_angle(self, angle: float) -> bool:
+    def set_camera_angle(
+        self, angle: float, priority: str = "high", attempts: int = 3
+    ) -> bool:
         self.angle = max(SERVO_MIN_ANGLE, min(SERVO_MAX_ANGLE, float(angle)))
         return True
