@@ -59,6 +59,8 @@ python3 decode_jpeg.py samples/map_Rx.txt samples/image.jpg
 | `main.py` | CLI: `--frame`, `--config`, `--json`, `--debug-out` |
 | `mars/config.py` | JSON → `SceneConfig`/`RouteSpec`, строгая валидация |
 | `mars/vision.py` | `analyze_frame`, `annotate`, `skeleton_length_px` |
+| `mars/aruco.py` | `detect_markers`, `annotate_markers`: ArUco id, центр, сторона в px |
+| `mars/scale.py` | `px_per_meter(markers, marker_size_m)` — масштаб по маркеру (B2) |
 | `mars/flight.py` | `FlightAdapter`, `SimulatedAdapter`, ленивый `PioneerAdapter` |
 | `config/routes.json` | палитра HSV, `px_per_meter`, `min_area_px`, флаг `dangerous` |
 | `tests/` | unittest, без железа |
@@ -67,6 +69,8 @@ python3 decode_jpeg.py samples/map_Rx.txt samples/image.jpg
 python3 main.py --frame samples/frames/frame.jpg --config config/routes.json \
     --debug-out samples/frames/frame_annotated.png
 python3 main.py --frame samples/frames/frame.jpg --json
+python3 -m mars.aruco samples/image.jpg --out samples/image_markers.png
+python3 -m mars.aruco samples/image.jpg --marker-size-m 0.15
 python3 -m unittest discover -s tests -v
 ```
 
@@ -75,6 +79,7 @@ python3 -m unittest discover -s tests -v
 - Опасный маршрут сейчас заглушка (синий №3). Реальный назначает спутниковая картинка — перепроверить, когда появятся кадры.
 - Длина — по 1-px скелету (морфологический скелет + Zhang-Suen, без `cv2.ximgproc`), диагональные шаги взвешены `sqrt(2)`. Не заменять на `cv2.arcLength` контура: он меряет периметр и завышает длину толстых линий.
 - При появлении кадров: положить в `samples/frames/`, откалибровать `hsv_ranges`, `px_per_meter`, `min_area_px`, уточнить `dangerous`.
+- ArUco на спутниковом снимке `samples/image.jpg`: словарь `DICT_4X4_50`, id 0 и 2. Детектор (`mars/aruco.py`) не падает на `None`/пустом кадре, неизвестный словарь → `ValueError`. Для реальных кадров словарь и `marker_size_m` перепроверить на поле.
 - План параллельной работы команды (владение файлами, ветки, фазы): `docs/stage2-plan.md`.
 
 ### Сеть дрона — читать перед подключением
