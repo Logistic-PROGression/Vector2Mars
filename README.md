@@ -100,6 +100,18 @@ python3 drone_tui.py --local     # запуск на борту
 В статусе появляется второй по длине маршрут, а полный список уходит в
 JSONL-журнал событием `routes`. Подробности — `docs/drone-tui.md`.
 
+Автономная миссия делает то же самое без ручного управления:
+
+```bash
+python3 photo_mission.py --dry-run              # проверка без железа
+python3 photo_mission.py --local                # взлёт, съёмка, посадка
+python3 photo_mission.py --local --quadrant sw  # полёт в нужную сторону
+```
+
+После успешной съёмки `photo_mission.py` сам прогоняет фото через
+`mars/arrow_routes.py` и печатает второй по длине маршрут, дублируя его в
+журнал событием `routes`.
+
 ## Тесты
 
 ```bash

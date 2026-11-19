@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from pathlib import Path
 
 from mars.drone import (
     DEFAULT_CAMERA,
@@ -287,6 +288,53 @@ def _notice(text: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {text}", flush=True)
 
 
+def _report_routes(photo: Path, logger: FlightLogger) -> None:
+    """Analyse the mission photo and print the second longest route.
+
+    Task 2 wants the route that is second by length. Vision is optional: any
+    failure is logged and reported, but it never changes the mission result.
+    """
+    try:
+        import cv2  # noqa: PLC0415 - optional heavy dependency
+
+        from mars.arrow_routes import (  # noqa: PLC0415
+            detect_arrow_routes,
+            second_longest_route,
+        )
+
+        frame = cv2.imread(str(photo))
+        routes = detect_arrow_routes(frame) if frame is not None else []
+        second = second_longest_route(routes)
+    except Exception as exc:  # noqa: BLE001 - never fail the mission on vision
+        logger.log("route_error", error=str(exc))
+        _notice(f"Маршруты не посчитаны: {exc}")
+        return
+
+    ranked = sorted(routes, key=lambda route: route.length_px, reverse=True)
+    summary = [
+        {
+            "start": route.start_marker_id,
+            "end": route.end_marker_id,
+            "arrows": len(route.arrows),
+            "length_px": round(route.length_px, 1),
+        }
+        for route in ranked
+    ]
+    logger.log(
+        "routes",
+        count=len(routes),
+        second=None if second is None else summary[1],
+        routes=summary,
+    )
+    if second is None:
+        _notice("Маршрутов меньше двух — второй по длине не определён")
+        return
+    _notice(
+        f"2-й маршрут {second.start_marker_id}->{second.end_marker_id}: "
+        f"стрелок {len(second.arrows)}, {second.length_px:.0f} px"
+    )
+
+
 _QUADRANT_SIGNS = {
     "ne": (1, 1),
     "nw": (-1, 1),
@@ -375,6 +423,8 @@ def main(argv: list[str] | None = None) -> int:
         result = run_photo_mission(
             link, config, logger, args.photo_dir, notice=_notice
         )
+        if result.ok and result.photo is not None:
+            _report_routes(result.photo, logger)
     except KeyboardInterrupt:
         logger.log("interrupted")
         print("Прервано оператором", file=sys.stderr)
