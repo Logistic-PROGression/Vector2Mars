@@ -74,23 +74,50 @@ def annotate_markers(image: object, markers: list[Marker] | None) -> np.ndarray:
     if base is None:
         base = np.zeros((480, 640, 3), dtype=np.uint8)
     canvas = base.copy()
+    height, width = canvas.shape[:2]
+    thickness = max(2, min(4, round(min(height, width) / 200)))
 
     for marker in markers or ():
         quad = marker.corners.astype(np.int32).reshape(-1, 1, 2)
-        cv2.polylines(canvas, [quad], True, (0, 255, 0), 2)
+        cv2.polylines(canvas, [quad], True, (0, 255, 0), thickness)
         x, y = (int(round(value)) for value in marker.center)
-        cv2.circle(canvas, (x, y), 3, (0, 0, 255), -1)
-        cv2.putText(
+        cv2.circle(canvas, (x, y), max(2, thickness), (0, 0, 255), -1)
+        _draw_label(
             canvas,
             f"id={marker.id}",
-            (x + 6, y - 6),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
+            (x + 2 * thickness, y - 2 * thickness),
             (0, 255, 0),
-            1,
-            cv2.LINE_AA,
         )
     return canvas
+
+
+def _draw_label(
+    canvas: np.ndarray,
+    text: str,
+    origin: tuple[int, int],
+    color: tuple[int, int, int],
+) -> None:
+    """Draw a marker id on a dark plate so it stays readable on any background."""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale, thickness = 0.5, 1
+    (text_width, text_height), baseline = cv2.getTextSize(
+        text, font, scale, thickness
+    )
+    max_x = max(0, canvas.shape[1] - text_width - 8)
+    max_y = max(text_height + 4, canvas.shape[0] - baseline - 4)
+    x = min(max(0, origin[0]), max_x)
+    y = min(max(text_height + 4, origin[1]), max_y)
+
+    cv2.rectangle(
+        canvas,
+        (x - 3, y - text_height - 3),
+        (x + text_width + 3, y + baseline + 3),
+        (0, 0, 0),
+        -1,
+    )
+    cv2.putText(
+        canvas, text, (x, y), font, scale, color, thickness, cv2.LINE_AA
+    )
 
 
 def _side_px(points: np.ndarray) -> float:
