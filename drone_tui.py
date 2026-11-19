@@ -27,6 +27,7 @@ from mars.drone import (
     DEFAULT_TCP,
     DroneLink,
     DroneUnavailable,
+    ServoScale,
     SimulatedLink,
     Telemetry,
 )
@@ -57,6 +58,18 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         choices=("high", "medium", "low"),
         default="high",
         help="приоритет команд сервопривода камеры (по умолчанию high)",
+    )
+    parser.add_argument(
+        "--servo-zero",
+        type=float,
+        default=30.0,
+        help="угол SDK, при котором камера смотрит в горизонт (по умолчанию 30)",
+    )
+    parser.add_argument(
+        "--servo-down",
+        type=float,
+        default=-80.0,
+        help="угол SDK, при котором камера смотрит вниз (по умолчанию -80)",
     )
     parser.add_argument(
         "--servo-test",
@@ -93,7 +106,10 @@ class Tui:
         self.running = True
         self.help_visible = False
         self.preview = False
-        self.camera_angle = 0.0
+        self.servo_scale = ServoScale(
+            sdk_min=args.servo_down, sdk_max=args.servo_zero
+        )
+        self.camera_angle = 0.0  # physical pitch: 0 = horizon, -90 = down
         self.servo_target: float | None = None
         self._last_servo_send = 0.0
         self.events: deque[str] = deque(maxlen=EVENT_LINES)
@@ -186,7 +202,7 @@ class Tui:
         elif name == "]":
             self._tilt(+SERVO_STEP)
         elif name in ("1", "2", "3", "4"):
-            self._set_tilt({"1": -80.0, "2": -40.0, "3": 0.0, "4": 30.0}[name])
+            self._set_tilt({"1": -90.0, "2": -60.0, "3": -30.0, "4": 0.0}[name])
         elif name in ("+", "="):
             self._change_speed(+0.1)
         elif name in ("-", "_"):
@@ -265,9 +281,12 @@ class Tui:
         self._set_tilt(self.camera_angle + delta)
 
     def _set_tilt(self, target: float) -> None:
-        target = max(-80.0, min(30.0, target))
+        target = self.servo_scale.clamp(target)
+        sdk_angle = self.servo_scale.to_sdk(target)
         try:
-            ok = self.link.set_camera_angle(target, priority=self.args.servo_priority)
+            ok = self.link.set_camera_angle(
+                sdk_angle, priority=self.args.servo_priority
+            )
         except DroneUnavailable as exc:
             self._note(str(exc))
             self.logger.log("tilt_unavailable", error=str(exc))
@@ -280,12 +299,18 @@ class Tui:
             self.servo_target = target
             self._last_servo_send = time.monotonic()
             self.logger.log(
-                "camera_angle", angle=target, priority=self.args.servo_priority
+                "camera_angle",
+                physical_deg=round(target, 1),
+                sdk_deg=round(sdk_angle, 1),
+                priority=self.args.servo_priority,
             )
             self._note(f"Камера: {target:.0f}°")
         else:
             self.logger.log(
-                "camera_angle_failed", angle=target, priority=self.args.servo_priority
+                "camera_angle_failed",
+                physical_deg=round(target, 1),
+                sdk_deg=round(sdk_angle, 1),
+                priority=self.args.servo_priority,
             )
             self._note("Сервопривод не подтвердил команду")
 
@@ -349,7 +374,9 @@ class Tui:
             self._last_servo_send = now
             try:
                 self.link.set_camera_angle(
-                    self.servo_target, priority=self.args.servo_priority, attempts=1
+                    self.servo_scale.to_sdk(self.servo_target),
+                    priority=self.args.servo_priority,
+                    attempts=1,
                 )
             except Exception:
                 pass
@@ -426,6 +453,7 @@ class Tui:
             4,
             f" Скорость: vx={velocity.vx:+.2f}  vy={velocity.vy:+.2f}  "
             f"vz={velocity.vz:+.2f}  yaw={velocity.yaw_rate:+.0f}°/с"
+            f"   камера {self.camera_angle:+.0f}°"
             f"   предел {self.state.speed:.1f} м/с",
         )
         self._add(5, " " + "─" * max(0, width - 2), curses.A_DIM)
@@ -470,14 +498,19 @@ def _run(screen, link: DroneLink, logger: FlightLogger, args: argparse.Namespace
 
 def _servo_test(link: DroneLink, args: argparse.Namespace) -> int:
     """Sweep the servo so a human can see whether it physically moves."""
-    print("Тест сервопривода: -80 → +30 → 0, шаг 10°.")
+    scale = ServoScale(sdk_min=args.servo_down, sdk_max=args.servo_zero)
+    print("Тест сервопривода: SDK -80 → +30, шаг 10° (в скобках — угол камеры).")
     for angle in [*range(-80, 31, 10), 0]:
         try:
             ok = link.set_camera_angle(angle, priority=args.servo_priority)
         except DroneUnavailable as exc:
             print(f"Сервопривод недоступен: {exc}")
             return 2
-        print(f"  {angle:+4d}° — {'команда отправлена' if ok else 'ОШИБКА отправки'}")
+        physical = scale.to_physical(angle)
+        print(
+            f"  SDK {angle:+4d}° (камера {physical:+5.0f}°) — "
+            f"{'команда отправлена' if ok else 'ОШИБКА отправки'}"
+        )
         time.sleep(0.8)
     print("Если камера не двигалась, проблема не в TUI: проверьте сервопривод и /tmp/servo.sock.")
     return 0

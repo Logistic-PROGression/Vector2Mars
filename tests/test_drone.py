@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mars.drone import SimulatedLink, Telemetry
+from mars.drone import ServoScale, SimulatedLink, Telemetry
 
 
 class TelemetryTests(unittest.TestCase):
@@ -30,6 +30,29 @@ class TelemetryTests(unittest.TestCase):
         self.assertIsNone(data["x"])
         self.assertIsNone(data["battery_v"])
         self.assertEqual(data["state"], "UNKNOWN")
+
+
+class ServoScaleTests(unittest.TestCase):
+    def test_measured_endpoints(self):
+        scale = ServoScale()
+        self.assertAlmostEqual(scale.to_sdk(0.0), 30.0)
+        self.assertAlmostEqual(scale.to_sdk(-90.0), -80.0)
+        self.assertAlmostEqual(scale.to_sdk(-45.0), -25.0)
+
+    def test_clamps_outside_physical_range(self):
+        scale = ServoScale()
+        self.assertAlmostEqual(scale.to_sdk(20.0), 30.0)
+        self.assertAlmostEqual(scale.to_sdk(-120.0), -80.0)
+
+    def test_round_trip(self):
+        scale = ServoScale()
+        for physical in (-90.0, -60.0, -30.0, 0.0):
+            self.assertAlmostEqual(scale.to_physical(scale.to_sdk(physical)), physical)
+
+    def test_custom_calibration(self):
+        scale = ServoScale(sdk_min=-70.0, sdk_max=20.0)
+        self.assertAlmostEqual(scale.to_sdk(0.0), 20.0)
+        self.assertAlmostEqual(scale.to_sdk(-90.0), -70.0)
 
 
 class SimulatedLinkTests(unittest.TestCase):

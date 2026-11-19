@@ -35,6 +35,46 @@ SERVO_MIN_ANGLE = -80.0
 SERVO_MAX_ANGLE = 30.0
 
 
+SERVO_PHYSICAL_MIN = -90.0
+SERVO_PHYSICAL_MAX = 0.0
+SERVO_SDK_AT_DOWN = -80.0
+SERVO_SDK_AT_HORIZON = 30.0
+
+
+@dataclass(frozen=True)
+class ServoScale:
+    """Maps physical camera pitch to the SDK servo angle.
+
+    The SDK range (-80..30) is not the optical range: on the Mini 2 the
+    camera looks horizontally at SDK +30 and straight down at SDK -80.
+    Physical angles therefore run from -90 (down) to 0 (horizon), and the
+    mapping is linear between the two measured endpoints.
+    """
+
+    physical_min: float = SERVO_PHYSICAL_MIN
+    physical_max: float = SERVO_PHYSICAL_MAX
+    sdk_min: float = SERVO_SDK_AT_DOWN
+    sdk_max: float = SERVO_SDK_AT_HORIZON
+
+    def clamp(self, physical: float) -> float:
+        return max(self.physical_min, min(self.physical_max, float(physical)))
+
+    def to_sdk(self, physical: float) -> float:
+        value = self.clamp(physical)
+        span = self.physical_max - self.physical_min
+        if span == 0:
+            return self.sdk_max
+        ratio = (value - self.physical_min) / span
+        return self.sdk_min + ratio * (self.sdk_max - self.sdk_min)
+
+    def to_physical(self, sdk: float) -> float:
+        span = self.sdk_max - self.sdk_min
+        if span == 0:
+            return self.physical_max
+        ratio = (float(sdk) - self.sdk_min) / span
+        return self.physical_min + ratio * (self.physical_max - self.physical_min)
+
+
 class DroneUnavailable(RuntimeError):
     """Raised when the SDK, the drone or the camera cannot be reached."""
 
