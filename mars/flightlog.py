@@ -50,3 +50,66 @@ class FlightLogger:
     def close(self) -> None:
         """Log the end of the session; the file needs no explicit close."""
         self.log("log_closed")
+
+
+class FlightTrack:
+    """Collects position samples so a flight can be replayed as a route.
+
+    The summary is written as a single ``flight_summary`` event and contains
+    everything needed to draw the path offline: start/end points, horizontal
+    length, duration and how high the drone climbed above its takeoff point.
+    """
+
+    def __init__(self) -> None:
+        self.started_at = datetime.now()
+        self.samples: list[dict[str, float | None]] = []
+        self.takeoff_altitude: float | None = None
+        self.max_altitude: float | None = None
+        self.path_length_m = 0.0
+        self._last_position: tuple[float, float, float] | None = None
+
+    def mark_takeoff(self, altitude_m: float | None) -> None:
+        self.takeoff_altitude = altitude_m
+        self.max_altitude = altitude_m
+
+    def add(self, telemetry) -> None:
+        """Append one telemetry sample and update distance/altitude stats."""
+        position = telemetry.position
+        if telemetry.altitude_m is not None:
+            if self.max_altitude is None or telemetry.altitude_m > self.max_altitude:
+                self.max_altitude = telemetry.altitude_m
+        if position is None:
+            return
+        x, y, z = (float(value) for value in position)
+        if self._last_position is not None:
+            px, py, _ = self._last_position
+            self.path_length_m += ((x - px) ** 2 + (y - py) ** 2) ** 0.5
+        self._last_position = (x, y, z)
+        self.samples.append(
+            {
+                "t": round((datetime.now() - self.started_at).total_seconds(), 2),
+                "x": round(x, 3),
+                "y": round(y, 3),
+                "z": round(z, 3),
+                "yaw_deg": None if telemetry.yaw_deg is None else round(telemetry.yaw_deg, 1),
+            }
+        )
+
+    def altitude_gain(self) -> float | None:
+        if self.max_altitude is None or self.takeoff_altitude is None:
+            return None
+        return max(0.0, self.max_altitude - self.takeoff_altitude)
+
+    def summary(self) -> dict[str, object]:
+        first = self.samples[0] if self.samples else {}
+        last = self.samples[-1] if self.samples else {}
+        return {
+            "duration_s": round((datetime.now() - self.started_at).total_seconds(), 1),
+            "samples": len(self.samples),
+            "takeoff_altitude_m": self.takeoff_altitude,
+            "max_altitude_m": self.max_altitude,
+            "altitude_gain_m": self.altitude_gain(),
+            "path_length_m": round(self.path_length_m, 2),
+            "start": {k: first.get(k) for k in ("x", "y", "z")},
+            "end": {k: last.get(k) for k in ("x", "y", "z")},
+        }

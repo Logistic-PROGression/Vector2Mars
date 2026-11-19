@@ -30,12 +30,12 @@ from mars.drone import (
     SimulatedLink,
     Telemetry,
 )
-from mars.flightlog import FlightLogger
+from mars.flightlog import FlightLogger, FlightTrack
 from mars.teleop import KEY_COMMANDS, KEY_HELP, ControlState, Velocity
 
 REFRESH_S = 0.1
 TELEMETRY_S = 0.5
-TELEMETRY_LOG_S = 2.0
+TELEMETRY_LOG_S = 1.0
 SERVO_STEP = 5.0
 EVENT_LINES = 6
 
@@ -78,6 +78,7 @@ class Tui:
             max_speed=args.max_speed,
         )
         self.telemetry = Telemetry()
+        self.track = FlightTrack()
         self.running = True
         self.help_visible = False
         self.preview = False
@@ -133,6 +134,8 @@ class Tui:
                 self.link.land()
             except Exception as exc:
                 self.logger.log("auto_land_failed", error=str(exc))
+        if self.track.samples:
+            self.logger.log("flight_summary", **self.track.summary())
         self.logger.log("tui_stopped")
 
     # -- input -------------------------------------------------------------
@@ -185,11 +188,27 @@ class Tui:
         self._note("Взлёт…")
         self.logger.log("takeoff_requested")
         try:
+            ground_altitude = self.link.telemetry().altitude_m
+        except Exception:
+            ground_altitude = None
+        try:
             ok = self.link.takeoff()
         except Exception as exc:
             ok = False
             self.logger.log("takeoff_error", error=str(exc))
         self.logger.log("takeoff", ok=bool(ok))
+        if ok:
+            self.track = FlightTrack()
+            self.track.mark_takeoff(ground_altitude)
+            try:
+                altitude = self.link.telemetry().altitude_m
+            except Exception:
+                altitude = None
+            self.logger.log(
+                "takeoff_complete",
+                altitude_m=altitude,
+                ground_altitude_m=ground_altitude,
+            )
         self._note("Взлёт выполнен" if ok else "Взлёт не подтверждён")
 
     def _land(self) -> None:
@@ -202,6 +221,12 @@ class Tui:
             ok = False
             self.logger.log("land_error", error=str(exc))
         self.logger.log("land", ok=bool(ok))
+        if ok:
+            try:
+                altitude = self.link.telemetry().altitude_m
+            except Exception:
+                altitude = None
+            self.logger.log("land_complete", altitude_m=altitude)
         self._note("Посадка выполнена" if ok else "Посадка не подтверждена")
 
     def _photo(self) -> None:
@@ -254,7 +279,13 @@ class Tui:
 
         if now - self._last_telemetry_log >= TELEMETRY_LOG_S:
             self._last_telemetry_log = now
-            self.logger.log("telemetry", **self.telemetry.as_dict())
+            self.track.add(self.telemetry)
+            self.logger.log(
+                "telemetry",
+                **self.telemetry.as_dict(),
+                altitude_gain_m=self.track.altitude_gain(),
+                path_length_m=round(self.track.path_length_m, 2),
+            )
 
         velocity = self.state.tick(now)
         self.velocity = velocity
