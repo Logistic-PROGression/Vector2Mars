@@ -81,6 +81,29 @@ def _single_route(reverse: bool = False) -> np.ndarray:
     return canvas
 
 
+def _draw_mixed_heads(
+    canvas: np.ndarray,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    forwards: tuple[bool, ...],
+) -> None:
+    """Draw arrows on one line, each pointing forward or back along it."""
+    first = np.asarray(start, dtype=np.float64)
+    last = np.asarray(end, dtype=np.float64)
+    direction = (last - first) / np.linalg.norm(last - first)
+    for fraction, forward in zip(np.linspace(0.3, 0.7, len(forwards)), forwards):
+        base = first + (last - first) * fraction
+        tip = base + direction * (40 if forward else -40)
+        cv2.arrowedLine(
+            canvas,
+            tuple(base.astype(int)),
+            tuple(tip.astype(int)),
+            (255, 255, 255),
+            6,
+            tipLength=0.5,
+        )
+
+
 def _two_routes() -> np.ndarray:
     canvas = _canvas()
     _paste_marker(canvas, 1, (120, 600))
@@ -173,6 +196,61 @@ class DetectArrowRoutesTest(unittest.TestCase):
     def test_route_direction_follows_arrowheads(self):
         route = detect_arrow_routes(_single_route(reverse=True))[0]
         self.assertEqual((route.start_marker_id, route.end_marker_id), (5, 1))
+
+    def test_route_direction_ignores_the_minority_of_heads(self):
+        canvas = _canvas(600, 700)
+        _paste_marker(canvas, 1, (120, 600))
+        _paste_marker(canvas, 5, (380, 150))
+        _draw_mixed_heads(canvas, (120, 600), (380, 150), (False, True, False))
+
+        route = detect_arrow_routes(canvas)[0]
+
+        self.assertEqual((route.start_marker_id, route.end_marker_id), (5, 1))
+
+    def test_chain_running_into_the_frame_edge_is_rejected(self):
+        canvas = _canvas(600, 700)
+        _paste_marker(canvas, 1, (120, 650))
+        _paste_marker(canvas, 5, (480, 650))
+        _draw_arrows(canvas, (120, 650), (480, 650), count=3)
+
+        self.assertEqual(detect_arrow_routes(canvas), [])
+
+    def test_same_chain_away_from_the_edge_is_kept(self):
+        canvas = _canvas(600, 700)
+        _paste_marker(canvas, 1, (120, 520))
+        _paste_marker(canvas, 5, (480, 520))
+        _draw_arrows(canvas, (120, 520), (480, 520), count=3)
+
+        routes = detect_arrow_routes(canvas)
+
+        self.assertEqual(len(routes), 1)
+        self.assertEqual(len(routes[0].arrows), 3)
+
+    def test_shadow_silhouette_is_not_white_paint(self):
+        canvas = _canvas(600, 700)
+        _paste_marker(canvas, 1, (120, 600))
+        _paste_marker(canvas, 5, (380, 150))
+        first = np.asarray((120, 600), dtype=np.float64)
+        last = np.asarray((380, 150), dtype=np.float64)
+        direction = (last - first) / np.linalg.norm(last - first)
+        for fraction, color in zip(
+            np.linspace(0.25, 0.7, 4),
+            ((255, 255, 255), (255, 255, 255), (55, 55, 55), (255, 255, 255)),
+        ):
+            base = first + (last - first) * fraction
+            cv2.arrowedLine(
+                canvas,
+                tuple(base.astype(int)),
+                tuple((base + direction * 40).astype(int)),
+                color,
+                6,
+                tipLength=0.5,
+            )
+
+        routes = detect_arrow_routes(canvas)
+
+        self.assertEqual(len(routes), 1)
+        self.assertEqual(len(routes[0].arrows), 3)
 
     def test_px_per_meter_adds_length_in_metres(self):
         route = detect_arrow_routes(_single_route(), px_per_meter=100.0)[0]

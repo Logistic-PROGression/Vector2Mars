@@ -6,14 +6,20 @@ so the detector works on shape rather than on a fixed colour or a straight
 corridor:
 
 1. arrow candidates are closed printed silhouettes found on the Canny edge
-   map, plus blobs of saturated colour (red/blue) on the colour masks;
+   map, blobs of saturated colour (red/blue) on the colour masks, and blobs of
+   white paint left by a local brightness threshold. White paint is only
+   accepted when its rim follows a printed outline and it is brighter than the
+   floor, so a cast shadow or a bright patch is not an arrow;
 2. every candidate is filtered by size/solidity expressed in marker sides, so
    the same code works on a 347x446 satellite image and on a 1920x2560 frame;
 3. candidates are linked into chains by a sparse neighbour graph (distance,
-   axis agreement), shortcut edges are pruned, and each chain is ordered;
-4. a chain becomes a route only when both of its ends sit next to a marker,
-   so a route is always identified by its marker pair. Several routes and
-   several markers in one frame therefore stay separate.
+   axis agreement), shortcut edges are pruned, and each chain is ordered. A
+   link never crosses a marker's quiet zone, because that empty ring is the
+   boundary between two routes that terminate at the same marker;
+4. a chain becomes a route only when each of its ends sits next to the marker
+   nearest to it, so a route is always identified by its marker pair. A chain
+   cut by the frame edge therefore stays unreported instead of being attached
+   to an unrelated marker or to a marker ring that was cut in two.
 
 The module is defensive: a missing, empty or malformed frame yields ``[]``.
 """
@@ -53,19 +59,49 @@ VALUE_PERCENTILE = 95.0
 RED_SATURATION_SCALE = 0.55
 RED_SATURATION_MIN = 40.0
 RED_SATURATION_MAX = 110.0
-BLUE_SATURATION_SCALE = 0.45
+BLUE_SATURATION_SCALE = 0.32
 BLUE_SATURATION_MIN = 35.0
 BLUE_SATURATION_MAX = 90.0
 VALUE_MIN_SCALE = 0.25
 VALUE_MIN_FLOOR = 30.0
 VALUE_MIN_CAP = 60.0
 
+# White paint has no hue to key on: it is the brightest, least saturated thing
+# on the floor. The threshold is local, so shadows and glare do not hide it.
+WHITE_SATURATION_MAX = 40.0
+WHITE_ADAPTIVE_BLOCK_UNITS = 2.0
+WHITE_ADAPTIVE_C = 12.0
+# Long thin bright seams and tape lines are not arrows: a vertical opening
+# drops them before they can merge with an arrow that lies across them. Only
+# full-size, distinctly arrow-shaped blobs are accepted from this source; it
+# is a recall fallback, not a second opinion on every bright spot.
+WHITE_OPEN_UNITS = 0.3
+WHITE_MIN_SIDE_FRACTION = 0.65
+WHITE_MIN_SOLIDITY = 0.75
+WHITE_MAX_SOLIDITY = 0.9
+# A soft bright patch on the floor also passes the local threshold, but its rim
+# only partly follows a printed outline. A real white arrow has a dark rim, so
+# most of its border lies on the edge map.
+WHITE_MIN_EDGE_SUPPORT = 0.8
+# White paint is brighter than the floor it lies on. A cast shadow of an arrow
+# has the same silhouette in the edge map but no brightness step, so it is not
+# accepted as paint.
+WHITE_MIN_CONTRAST = 20.0
+WHITE_RING_UNITS = 0.35
+
 # Chain graph: arrows of one route are close and point roughly along the path.
 LINK_MAX_STEP_UNITS = 2.6
-LINK_MAX_TURN_DEG = 50.0
+LINK_MAX_TURN_DEG = 65.0
 LINK_NEIGHBOURS = 2
 PRUNE_DETOUR_RATIO = 1.12
-MARKER_REACH_UNITS = 6.0
+# A chain ends at a marker: it never crosses the empty quiet zone around one,
+# and each end attaches only to the nearest marker, within this reach.
+MARKER_ZONE_UNITS = 1.5
+MARKER_ZONE_END_MARGIN = 0.1
+MARKER_REACH_UNITS = 3.0
+# An interior arrow closer to the frame border than this means the chain runs
+# off the picture; only the arrows at a marker may sit that close to the edge.
+FRAME_EDGE_UNITS = 0.9
 
 COLOUR_RED = "red"
 COLOUR_BLUE = "blue"
@@ -158,7 +194,7 @@ def detect_arrow_routes(
     if len(arrows) < min_arrows:
         return []
 
-    adjacency = _link_graph(arrows, unit)
+    adjacency = _link_graph(arrows, marker_list, unit)
     adjacency = _prune_shortcuts(adjacency, arrows)
 
     chains: list[_Chain] = []
@@ -168,7 +204,9 @@ def detect_arrow_routes(
         path = _order_chain(adjacency, component, arrows)
         if len(path) < min_arrows:
             continue
-        chain = _match_markers(path, arrows, marker_list, unit)
+        chain = _match_markers(
+            path, arrows, marker_list, unit, (bgr.shape[0], bgr.shape[1])
+        )
         if chain is not None:
             chains.append(chain)
 
@@ -264,6 +302,9 @@ def _find_arrows(bgr: np.ndarray, markers: list[Marker], unit: float) -> list[_A
     )
     edges = cv2.Canny(gray, CANNY_LOW_RATIO * canny_high, canny_high)
     edges = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    # Tolerant edge map for the white-paint check below: the rim of a paint blob
+    # is a few pixels wide, so the contour may sit next to an edge, not on it.
+    edge_support = cv2.dilate(edges, np.ones((3, 3), np.uint8))
 
     # Saturated arrows (red/blue) also give solid colour blobs; adding them
     # recovers arrows whose outline is broken by glare. Saturation and value
@@ -306,6 +347,29 @@ def _find_arrows(bgr: np.ndarray, markers: list[Marker], unit: float) -> list[_A
         filled = (mask.astype(np.uint8) * 255)
         sources.append(cv2.morphologyEx(filled, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)))
 
+    # White arrows need their own source: on a beige or grey floor the edge map
+    # may leave them open, while their paint is still the brightest low-
+    # saturation area. The adaptive threshold follows the local floor, and the
+    # vertical opening removes thin bright seams that would swallow an arrow.
+    block = int(round(WHITE_ADAPTIVE_BLOCK_UNITS * unit)) | 1
+    block = max(15, min(block, 151))
+    adaptive = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        block,
+        -WHITE_ADAPTIVE_C,
+    )
+    white = np.where(saturation < WHITE_SATURATION_MAX, adaptive, 0).astype(np.uint8)
+    open_height = max(3, int(round(WHITE_OPEN_UNITS * unit)) | 1)
+    white = cv2.morphologyEx(
+        white,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (1, open_height)),
+    )
+    sources.append(white)
+
     min_area = max(MIN_AREA_FRACTION * unit * unit, MIN_AREA_PX)
     max_area = MAX_AREA_FRACTION * unit * unit
     min_side = MIN_SIDE_FRACTION * unit
@@ -314,7 +378,10 @@ def _find_arrows(bgr: np.ndarray, markers: list[Marker], unit: float) -> list[_A
     margin_y = 0.01 * height
 
     candidates: list[tuple[np.ndarray, int, str, np.ndarray]] = []
-    for source in sources:
+    for source_index, source in enumerate(sources):
+        # The last source is the white-paint fallback; it accepts only blobs
+        # that are both full-size and clearly arrow-shaped.
+        white_only = source_index == len(sources) - 1
         contours, _ = cv2.findContours(source, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         for contour in contours:
             area = cv2.contourArea(contour)
@@ -326,7 +393,17 @@ def _find_arrows(bgr: np.ndarray, markers: list[Marker], unit: float) -> list[_A
             if max(w, h) / max(min(w, h), 1) > MAX_BBOX_ASPECT:
                 continue
             hull = cv2.convexHull(contour)
-            if area / max(cv2.contourArea(hull), 1.0) < MIN_SOLIDITY:
+            solidity = area / max(cv2.contourArea(hull), 1.0)
+            if solidity < MIN_SOLIDITY:
+                continue
+            if white_only and not (
+                max(w, h) >= WHITE_MIN_SIDE_FRACTION * unit
+                and WHITE_MIN_SOLIDITY <= solidity <= WHITE_MAX_SOLIDITY
+            ):
+                continue
+            if white_only and _edge_support(contour, edge_support, gray.shape) < (
+                WHITE_MIN_EDGE_SUPPORT
+            ):
                 continue
             perimeter = cv2.arcLength(contour, True)
             polygon = cv2.approxPolyDP(contour, 0.04 * perimeter, True)
@@ -347,7 +424,12 @@ def _find_arrows(bgr: np.ndarray, markers: list[Marker], unit: float) -> list[_A
             mask = np.zeros(gray.shape, dtype=np.uint8)
             cv2.drawContours(mask, [contour], -1, 255, -1)
             mask = cv2.erode(mask, np.ones((3, 3), np.uint8))
-            candidates.append((center, int(area), _color_of(bgr, mask), contour))
+            color = _color_of(bgr, mask)
+            if color == COLOUR_WHITE and _local_contrast(gray, contour, unit) < (
+                WHITE_MIN_CONTRAST
+            ):
+                continue
+            candidates.append((center, int(area), color, contour))
 
     # Nested contours of one arrow (outer + inner edge) collapse to the largest.
     candidates.sort(key=lambda item: -item[1])
@@ -375,6 +457,43 @@ def _find_arrows(bgr: np.ndarray, markers: list[Marker], unit: float) -> list[_A
             )
         )
     return result
+
+
+def _local_contrast(gray: np.ndarray, contour: np.ndarray, unit: float) -> float:
+    """Brightness step between a contour's fill and the floor around it.
+
+    Printed white paint is brighter than the floor, while the shadow of an
+    arrow has an arrow silhouette in the edge map but almost no step. The
+    reference ring is the bounding box grown by :data:`WHITE_RING_UNITS`, so it
+    follows the local lighting instead of a frame-wide level.
+    """
+    mask = np.zeros(gray.shape, dtype=np.uint8)
+    cv2.drawContours(mask, [contour], -1, 255, -1)
+    x, y, w, h = cv2.boundingRect(contour)
+    pad = max(2, int(round(WHITE_RING_UNITS * unit)))
+    ring = np.zeros_like(mask)
+    ring[max(0, y - pad) : y + h + pad, max(0, x - pad) : x + w + pad] = 255
+    ring[mask > 0] = 0
+    if not np.any(ring):
+        return 0.0
+    return float(cv2.mean(gray, mask=mask)[0]) - float(cv2.mean(gray, mask=ring)[0])
+
+
+def _edge_support(contour: np.ndarray, edges: np.ndarray, shape: tuple[int, ...]) -> float:
+    """Fraction of a contour's border that lies on the printed outline.
+
+    A real arrow has a dark rim, so its paint blob is bounded by edges. A soft
+    brightness patch on the floor passes the local white threshold too, but
+    only part of its rim coincides with an outline; this ratio separates them.
+    """
+    mask = np.zeros(shape, dtype=np.uint8)
+    cv2.drawContours(mask, [contour], -1, 255, -1)
+    border = cv2.morphologyEx(mask, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8))
+    pixels = border > 0
+    total = int(np.count_nonzero(pixels))
+    if total == 0:
+        return 0.0
+    return float(np.count_nonzero(edges[pixels])) / total
 
 
 def _axis_and_head(contour: np.ndarray) -> tuple[np.ndarray | None, int, float]:
@@ -424,7 +543,9 @@ def _color_of(bgr: np.ndarray, mask: np.ndarray) -> str:
     return COLOUR_WHITE
 
 
-def _link_graph(arrows: list[_Arrow], unit: float) -> dict[int, set[int]]:
+def _link_graph(
+    arrows: list[_Arrow], markers: list[Marker], unit: float
+) -> dict[int, set[int]]:
     """Connect each arrow to its nearest compatible neighbours."""
     adjacency: dict[int, set[int]] = {arrow.index: set() for arrow in arrows}
     cos_turn = math.cos(math.radians(LINK_MAX_TURN_DEG))
@@ -437,6 +558,8 @@ def _link_graph(arrows: list[_Arrow], unit: float) -> dict[int, set[int]]:
             distance = float(np.linalg.norm(delta))
             if not 0.4 * unit <= distance <= LINK_MAX_STEP_UNITS * unit:
                 continue
+            if _crosses_marker_zone(first.center, second.center, markers, unit):
+                continue
             direction = delta / distance
             if abs(float(direction @ first.axis)) < cos_turn:
                 continue
@@ -448,6 +571,31 @@ def _link_graph(arrows: list[_Arrow], unit: float) -> dict[int, set[int]]:
             adjacency[first.index].add(index)
             adjacency[index].add(first.index)
     return adjacency
+
+
+def _crosses_marker_zone(
+    first: np.ndarray, second: np.ndarray, markers: list[Marker], unit: float
+) -> bool:
+    """Whether a link passes through the empty quiet zone of a marker.
+
+    Consecutive arrows of one route are close, but the ring around a marker is
+    unpainted. When two routes terminate at the same marker their ends are
+    close as well, so a link across that empty ring would join them. Only the
+    middle of a link is checked: an end arrow is expected to sit near a marker.
+    """
+    delta = second - first
+    length_sq = float(delta @ delta)
+    if length_sq <= 0.0:
+        return True
+    for marker in markers:
+        center = np.asarray(marker.center, dtype=np.float64)
+        t = float((center - first) @ delta) / length_sq
+        if not MARKER_ZONE_END_MARGIN <= t <= 1.0 - MARKER_ZONE_END_MARGIN:
+            continue
+        closest = first + t * delta
+        if float(np.linalg.norm(center - closest)) < MARKER_ZONE_UNITS * unit:
+            return True
+    return False
 
 
 def _prune_shortcuts(
@@ -535,27 +683,57 @@ def _direction(origin: _Arrow, target: _Arrow) -> np.ndarray:
 
 
 def _match_markers(
-    path: list[int], arrows: list[_Arrow], markers: list[Marker], unit: float
+    path: list[int],
+    arrows: list[_Arrow],
+    markers: list[Marker],
+    unit: float,
+    frame_shape: tuple[int, int],
 ) -> _Chain | None:
-    """Attach chain ends to the closest pair of different markers."""
+    """Attach both chain ends to the markers nearest to them.
+
+    Only the nearest marker can own an end. A generous "any marker within
+    reach" rule attaches a chain cut by the frame edge to whatever marker
+    happens to be on that side, which invents a route between two markers that
+    the chain never connected.
+
+    A chain whose interior arrows run into the frame border is also rejected:
+    a printed route leaves the picture only at a marker, so an arrow that close
+    to the edge is a fragment (a cut marker ring, a clipped arrow) and the chain
+    that contains it has most likely lost its rest outside the frame.
+    """
     by_index = {arrow.index: arrow for arrow in arrows}
     head = by_index[path[0]]
     tail = by_index[path[-1]]
-    best: tuple[float, Marker, Marker] | None = None
-    for start in markers:
-        for end in markers:
-            if start.id == end.id:
-                continue
-            head_gap = float(np.linalg.norm(head.center - np.asarray(start.center)))
-            tail_gap = float(np.linalg.norm(tail.center - np.asarray(end.center)))
-            if head_gap > MARKER_REACH_UNITS * unit or tail_gap > MARKER_REACH_UNITS * unit:
-                continue
-            if best is None or head_gap + tail_gap < best[0]:
-                best = (head_gap + tail_gap, start, end)
-    if best is None:
+    start, head_gap = _nearest_marker(head.center, markers)
+    end, tail_gap = _nearest_marker(tail.center, markers)
+    if start is None or end is None or start.id == end.id:
         return None
-    _, start, end = best
+    if head_gap > MARKER_REACH_UNITS * unit or tail_gap > MARKER_REACH_UNITS * unit:
+        return None
+    for index in path[1:-1]:
+        if _border_gap(by_index[index].center, frame_shape) < FRAME_EDGE_UNITS * unit:
+            return None
     return _Chain(start=start, end=end, arrows=[by_index[index] for index in path])
+
+
+def _border_gap(center: np.ndarray, frame_shape: tuple[int, int]) -> float:
+    """Shortest distance from ``center`` to the frame border, in pixels."""
+    height, width = frame_shape
+    x, y = float(center[0]), float(center[1])
+    return min(x, y, width - x, height - y)
+
+
+def _nearest_marker(
+    center: np.ndarray, markers: list[Marker]
+) -> tuple[Marker | None, float]:
+    """Return the marker closest to ``center`` and the distance to it."""
+    best: Marker | None = None
+    best_gap = math.inf
+    for marker in markers:
+        gap = float(np.linalg.norm(center - np.asarray(marker.center, dtype=np.float64)))
+        if gap < best_gap:
+            best, best_gap = marker, gap
+    return best, best_gap
 
 
 def _to_public(chain: _Chain, px_per_meter: float | None, unit: float) -> ArrowRoute:
@@ -564,14 +742,15 @@ def _to_public(chain: _Chain, px_per_meter: float | None, unit: float) -> ArrowR
     start_center = np.asarray(chain.start.center, dtype=np.float64)
     end_center = np.asarray(chain.end.center, dtype=np.float64)
 
-    # Majority vote of arrowheads decides the travel direction.
+    # Majority vote of arrowheads decides the travel direction. Travel runs
+    # towards the next arrow, and past the last arrow away from the previous
+    # one, so every vote describes the same route direction.
     votes = 0
     for index, arrow in enumerate(arrows):
         if index + 1 < len(arrows):
             travel = arrows[index + 1].center - arrow.center
         else:
             travel = arrow.center - arrows[index - 1].center
-            travel = -travel
         travel /= max(float(np.linalg.norm(travel)), 1e-9)
         votes += arrow.head_sign * (1 if float(arrow.axis @ travel) >= 0 else -1)
 
