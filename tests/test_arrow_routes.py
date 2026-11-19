@@ -92,6 +92,56 @@ def _two_routes() -> np.ndarray:
     return canvas
 
 
+def _draw_arc_arrows(
+    canvas: np.ndarray,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    sag: float = 90.0,
+    count: int = 5,
+    color: tuple[int, int, int] = (255, 255, 255),
+) -> None:
+    """Draw arrows along a curved (quadratic) path, tangent to the curve."""
+    first = np.asarray(start, dtype=np.float64)
+    last = np.asarray(end, dtype=np.float64)
+    axis = last - first
+    normal = np.asarray((-axis[1], axis[0])) / np.linalg.norm(axis)
+    control = (first + last) / 2 + normal * sag * 2
+    for t in np.linspace(0.2, 0.8, count):
+        point = (1 - t) ** 2 * first + 2 * (1 - t) * t * control + t**2 * last
+        tangent = 2 * (1 - t) * (control - first) + 2 * t * (last - control)
+        tangent /= np.linalg.norm(tangent)
+        tip = point + tangent * 40
+        cv2.arrowedLine(
+            canvas,
+            tuple(point.astype(int)),
+            tuple(tip.astype(int)),
+            color,
+            6,
+            tipLength=0.5,
+        )
+
+
+def _mixed_colour_route() -> np.ndarray:
+    canvas = _canvas(600, 700)
+    _paste_marker(canvas, 1, (120, 600))
+    _paste_marker(canvas, 5, (380, 150))
+    first = np.asarray((120, 600), dtype=np.float64)
+    last = np.asarray((380, 150), dtype=np.float64)
+    direction = (last - first) / np.linalg.norm(last - first)
+    colours = ((255, 255, 255), (0, 0, 255), (255, 0, 0))
+    for fraction, color in zip(np.linspace(0.3, 0.7, 3), colours):
+        base = first + (last - first) * fraction
+        cv2.arrowedLine(
+            canvas,
+            tuple(base.astype(int)),
+            tuple((base + direction * 40).astype(int)),
+            color,
+            6,
+            tipLength=0.5,
+        )
+    return canvas
+
+
 class DetectArrowRoutesTest(unittest.TestCase):
     def test_detects_one_route_between_its_markers(self):
         image = _single_route()
@@ -128,6 +178,49 @@ class DetectArrowRoutesTest(unittest.TestCase):
         route = detect_arrow_routes(_single_route(), px_per_meter=100.0)[0]
         self.assertIsNotNone(route.length_m)
         self.assertAlmostEqual(route.length_m, route.length_px / 100.0)
+
+    def test_curved_route_is_followed(self):
+        canvas = _canvas(600, 700)
+        _paste_marker(canvas, 1, (120, 600))
+        _paste_marker(canvas, 5, (380, 150))
+        _draw_arc_arrows(canvas, (120, 600), (380, 150), sag=90, count=5)
+
+        routes = detect_arrow_routes(canvas)
+
+        self.assertEqual(len(routes), 1)
+        route = routes[0]
+        self.assertEqual(frozenset((route.start_marker_id, route.end_marker_id)), frozenset((1, 5)))
+        self.assertEqual(len(route.arrows), 5)
+        straight = float(np.linalg.norm(np.subtract((380, 150), (120, 600))))
+        self.assertGreater(route.length_px, straight)
+
+    def test_mixed_colour_arrows_form_one_route(self):
+        route = detect_arrow_routes(_mixed_colour_route())[0]
+        self.assertEqual(len(route.arrows), 3)
+        self.assertEqual(set(route.colors), {"white", "red", "blue"})
+
+    def test_different_arrow_sizes_form_one_route(self):
+        canvas = _canvas(600, 700)
+        _paste_marker(canvas, 1, (120, 600))
+        _paste_marker(canvas, 5, (380, 150))
+        first = np.asarray((120, 600), dtype=np.float64)
+        last = np.asarray((380, 150), dtype=np.float64)
+        direction = (last - first) / np.linalg.norm(last - first)
+        for fraction, length in zip(np.linspace(0.3, 0.7, 3), (26, 44, 64)):
+            base = first + (last - first) * fraction
+            cv2.arrowedLine(
+                canvas,
+                tuple(base.astype(int)),
+                tuple((base + direction * length).astype(int)),
+                (255, 255, 255),
+                6,
+                tipLength=0.5,
+            )
+
+        routes = detect_arrow_routes(canvas)
+
+        self.assertEqual(len(routes), 1)
+        self.assertEqual(len(routes[0].arrows), 3)
 
     def test_small_noise_is_ignored(self):
         canvas = _single_route()
