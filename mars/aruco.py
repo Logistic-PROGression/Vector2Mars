@@ -47,13 +47,30 @@ def detect_markers(
     params = cv2.aruco.DetectorParameters()
     params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
     detector = cv2.aruco.ArucoDetector(aruco_dict, params)
+
+    markers = _detect_pass(detector, gray)
+    # Small or softly focused markers disappear on a dim frame. A local
+    # contrast stretch recovers them; results are merged by id and the plain
+    # pass keeps priority, so normal frames are unaffected.
+    if gray.size:
+        enhanced = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)
+        known = {marker.id for marker in markers}
+        markers.extend(
+            marker for marker in _detect_pass(detector, enhanced) if marker.id not in known
+        )
+    return sorted(markers, key=lambda marker: marker.id)
+
+
+def _detect_pass(
+    detector: cv2.aruco.ArucoDetector, gray: np.ndarray
+) -> list[Marker]:
+    """Run one detector pass and convert its output into :class:`Marker`."""
     try:
         corners, ids, _ = detector.detectMarkers(gray)
     except cv2.error:
         return []
     if ids is None:
         return []
-
     markers: list[Marker] = []
     for marker_id, quad in zip(ids.ravel(), corners):
         points = np.asarray(quad, dtype=np.float32).reshape(4, 2)
@@ -65,7 +82,7 @@ def detect_markers(
                 side_px=_side_px(points),
             )
         )
-    return sorted(markers, key=lambda marker: marker.id)
+    return markers
 
 
 def annotate_markers(image: object, markers: list[Marker] | None) -> np.ndarray:

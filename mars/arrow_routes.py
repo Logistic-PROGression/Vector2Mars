@@ -41,12 +41,31 @@ MAX_BBOX_ASPECT = 2.8
 MIN_SOLIDITY = 0.45  # thin shafts of long arrows fill only ~half of their hull
 MIN_AREA_PX = 25.0
 
+# Edge and colour thresholds follow the frame statistics so exposure changes do
+# not hide paint: limits are percentiles of this frame, scaled and clamped.
+CANNY_PERCENTILE = 99.0
+CANNY_SCALE = 0.75
+CANNY_HIGH_MIN = 25.0
+CANNY_HIGH_MAX = 90.0
+CANNY_LOW_RATIO = 0.4
+SATURATION_PERCENTILE = 99.0
+VALUE_PERCENTILE = 95.0
+RED_SATURATION_SCALE = 0.55
+RED_SATURATION_MIN = 40.0
+RED_SATURATION_MAX = 110.0
+BLUE_SATURATION_SCALE = 0.45
+BLUE_SATURATION_MIN = 35.0
+BLUE_SATURATION_MAX = 90.0
+VALUE_MIN_SCALE = 0.25
+VALUE_MIN_FLOOR = 30.0
+VALUE_MIN_CAP = 60.0
+
 # Chain graph: arrows of one route are close and point roughly along the path.
 LINK_MAX_STEP_UNITS = 2.6
 LINK_MAX_TURN_DEG = 50.0
 LINK_NEIGHBOURS = 2
 PRUNE_DETOUR_RATIO = 1.12
-MARKER_REACH_UNITS = 4.0
+MARKER_REACH_UNITS = 6.0
 
 COLOUR_RED = "red"
 COLOUR_BLUE = "blue"
@@ -220,16 +239,58 @@ def _find_arrows(bgr: np.ndarray, markers: list[Marker], unit: float) -> list[_A
     height, width = gray.shape[:2]
 
     # Printed arrows always have a thin dark outline, so the edge map gives a
-    # closed silhouette whatever colour the arrow itself is.
-    edges = cv2.Canny(gray, 25, 70)
+    # closed silhouette whatever colour the arrow itself is. Canny limits follow
+    # the frame contrast: a fixed pair loses white arrows when the light floor
+    # and the white paint merge, and floods the map with texture in harsh light.
+    gradient_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gradient_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    gradient = cv2.magnitude(gradient_x, gradient_y)
+    canny_high = float(
+        np.clip(
+            CANNY_SCALE * np.percentile(gradient, CANNY_PERCENTILE),
+            CANNY_HIGH_MIN,
+            CANNY_HIGH_MAX,
+        )
+    )
+    edges = cv2.Canny(gray, CANNY_LOW_RATIO * canny_high, canny_high)
     edges = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
 
     # Saturated arrows (red/blue) also give solid colour blobs; adding them
-    # recovers arrows whose outline is broken by glare.
+    # recovers arrows whose outline is broken by glare. Saturation and value
+    # limits are taken from the frame itself so exposure shifts do not hide
+    # coloured paint.
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     hue, saturation, value = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
-    red_mask = (((hue <= 14) | (hue >= 163)) & (saturation > 110) & (value > 60))
-    blue_mask = ((hue >= 95) & (hue <= 140) & (saturation > 80) & (value > 45))
+    saturation_high = float(np.percentile(saturation, SATURATION_PERCENTILE))
+    value_high = float(np.percentile(value, VALUE_PERCENTILE))
+    red_saturation = float(
+        np.clip(
+            RED_SATURATION_SCALE * saturation_high,
+            RED_SATURATION_MIN,
+            RED_SATURATION_MAX,
+        )
+    )
+    blue_saturation = float(
+        np.clip(
+            BLUE_SATURATION_SCALE * saturation_high,
+            BLUE_SATURATION_MIN,
+            BLUE_SATURATION_MAX,
+        )
+    )
+    value_min = float(
+        np.clip(VALUE_MIN_SCALE * value_high, VALUE_MIN_FLOOR, VALUE_MIN_CAP)
+    )
+    red_mask = (
+        ((hue <= 14) | (hue >= 163))
+        & (saturation > red_saturation)
+        & (value > value_min)
+    )
+    blue_mask = (
+        (hue >= 95)
+        & (hue <= 140)
+        & (saturation > blue_saturation)
+        & (value > value_min)
+    )
     sources = [edges]
     for mask in (red_mask, blue_mask):
         filled = (mask.astype(np.uint8) * 255)
@@ -340,11 +401,15 @@ def _axis_and_head(contour: np.ndarray) -> tuple[np.ndarray | None, int, float]:
 
 
 def _color_of(bgr: np.ndarray, mask: np.ndarray) -> str:
-    """Classify the arrow colour by mean channel values inside ``mask``."""
+    """Classify the arrow colour by channel ratios inside ``mask``.
+
+    Ratios rather than absolute levels keep the label stable when the frame is
+    darker or brighter: a shadowed red arrow is still red.
+    """
     blue, green, red = (float(channel) for channel in cv2.mean(bgr, mask=mask)[:3])
-    if red > 1.35 * max(green, blue) and red > 70:
+    if red > 1.35 * max(green, blue) and red > 40:
         return COLOUR_RED
-    if blue > 1.15 * max(red, green) and blue > 60:
+    if blue > 1.15 * max(red, green) and blue > 35:
         return COLOUR_BLUE
     return COLOUR_WHITE
 
