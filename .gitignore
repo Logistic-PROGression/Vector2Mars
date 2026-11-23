@@ -213,3 +213,10 @@ backend/seed_db.py
 
 # Flight TUI artifacts
 photos/
+
+# Working drone frames: keep the tree clean, but report assets stay tracked
+samples/frames/*
+!samples/frames/README.md
+!samples/frames/annotated/
+samples/frames/annotated/*
+!samples/frames/annotated/photo_20260807_154909_148836_annotated.png

@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="340" viewBox="0 0 1000 340" role="img" aria-label="Схема конвейера: кадр, ArUco, кандидаты стрелок, граф, длина и выбор, ответ">
+  <defs>
+    <style>
+      .stage { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.4; }
+      .stage-title { font-family: "DejaVu Sans", sans-serif; font-size: 16px; font-weight: bold; fill: #1e3a5f; }
+      .stage-sub { font-family: "DejaVu Sans", sans-serif; font-size: 14px; fill: #475569; }
+      .aux { fill: #eef2f7; stroke: #94a3b8; stroke-width: 1.2; stroke-dasharray: 6 5; }
+      .aux-title { font-family: "DejaVu Sans", sans-serif; font-size: 14px; font-weight: bold; fill: #1e3a5f; }
+      .aux-sub { font-family: "DejaVu Sans", sans-serif; font-size: 12.5px; fill: #475569; }
+      .answer { fill: #fff7ed; stroke: #ea580c; stroke-width: 1.8; }
+      .answer-title { font-family: "DejaVu Sans", sans-serif; font-size: 17px; font-weight: bold; fill: #9a3412; }
+      .answer-sub { font-family: "DejaVu Sans", sans-serif; font-size: 14.5px; fill: #7c2d12; }
+      .flow { stroke: #94a3b8; stroke-width: 2.2; fill: none; }
+      .head { fill: #94a3b8; }
+      .hint { font-family: "DejaVu Sans", sans-serif; font-size: 12.5px; fill: #94a3b8; }
+      .foot { font-family: "DejaVu Sans", sans-serif; font-size: 12px; fill: #64748b; }
+      .accent { fill: #ea580c; }
+    </style>
+  </defs>
+
+  <!-- auxiliary inputs -->
+  <text class="hint" x="12" y="48">Дополнительные</text>
+  <text class="hint" x="12" y="66">входы</text>
+
+  <g>
+    <rect class="aux" x="412" y="20" width="376" height="66" rx="8"/>
+    <text class="aux-title" x="428" y="44">Серия кадров с БПЛА</text>
+    <text class="aux-sub" x="428" y="64">сшивка по ArUco-меткам</text>
+    <text class="aux-sub" x="428" y="79">голосование: стрелка 2 из 3</text>
+  </g>
+
+  <g>
+    <rect class="aux" x="812" y="20" width="176" height="66" rx="8"/>
+    <text class="aux-title" x="826" y="44">Спутниковый</text>
+    <text class="aux-title" x="826" y="60">снимок</text>
+    <text class="aux-sub" x="826" y="79">пара 0 → 2</text>
+  </g>
+
+  <!-- main pipeline -->
+  <g>
+    <rect class="stage" x="12" y="110" width="176" height="86" rx="8"/>
+    <rect class="accent" x="12" y="110" width="176" height="3.4" rx="1.7"/>
+    <text class="stage-title" x="26" y="142">Кадр с камеры</text>
+    <text class="stage-sub" x="26" y="167">JPEG · PNG</text>
+    <text class="stage-sub" x="26" y="184">борт или файл</text>
+  </g>
+
+  <g>
+    <rect class="stage" x="212" y="110" width="176" height="86" rx="8"/>
+    <rect class="accent" x="212" y="110" width="176" height="3.4" rx="1.7"/>
+    <text class="stage-title" x="226" y="142">ArUco 4×4</text>
+    <text class="stage-sub" x="226" y="167">ID · центр · сторона</text>
+    <text class="stage-sub" x="226" y="184">масштаб u, px</text>
+  </g>
+
+  <g>
+    <rect class="stage" x="412" y="110" width="176" height="86" rx="8"/>
+    <rect class="accent" x="412" y="110" width="176" height="3.4" rx="1.7"/>
+    <text class="stage-title" x="426" y="142">Кандидаты</text>
+    <text class="stage-sub" x="426" y="167">Canny-контуры</text>
+    <text class="stage-sub" x="426" y="184">+ HSV-маски</text>
+  </g>
+
+  <g>
+    <rect class="stage" x="612" y="110" width="176" height="86" rx="8"/>
+    <rect class="accent" x="612" y="110" width="176" height="3.4" rx="1.7"/>
+    <text class="stage-title" x="626" y="142">Граф и цепочки</text>
+    <text class="stage-sub" x="626" y="167">соседи · 0,4u–2,6u</text>
+    <text class="stage-sub" x="626" y="184">привязка к меткам</text>
+  </g>
+
+  <g>
+    <rect class="stage" x="812" y="110" width="176" height="86" rx="8"/>
+    <rect class="accent" x="812" y="110" width="176" height="3.4" rx="1.7"/>
+    <text class="stage-title" x="826" y="142">Длина и выбор</text>
+    <text class="stage-sub" x="826" y="167">ломаная, px</text>
+    <text class="stage-sub" x="826" y="184">минус опасная пара</text>
+  </g>
+
+  <!-- main arrows -->
+  <g class="flow">
+    <line x1="191" y1="153" x2="199" y2="153"/>
+    <line x1="391" y1="153" x2="399" y2="153"/>
+    <line x1="591" y1="153" x2="599" y2="153"/>
+    <line x1="791" y1="153" x2="799" y2="153"/>
+  </g>
+  <g class="head">
+    <polygon points="208,153 199,147.5 199,158.5"/>
+    <polygon points="408,153 399,147.5 399,158.5"/>
+    <polygon points="608,153 599,147.5 599,158.5"/>
+    <polygon points="808,153 799,147.5 799,158.5"/>
+  </g>
+
+  <!-- aux connectors -->
+  <g class="flow">
+    <line x1="700" y1="86" x2="700" y2="100" stroke-dasharray="6 5"/>
+    <line x1="900" y1="86" x2="900" y2="100" stroke-dasharray="6 5"/>
+  </g>
+  <g class="head">
+    <polygon points="700,108 694,98 706,98"/>
+    <polygon points="900,108 894,98 906,98"/>
+  </g>
+
+  <!-- answer -->
+  <g class="flow">
+    <line x1="900" y1="196" x2="900" y2="214"/>
+  </g>
+  <g class="head">
+    <polygon points="900,223 894,213 906,213"/>
+  </g>
+  <rect class="answer" x="12" y="226" width="976" height="56" rx="8"/>
+  <text class="answer-title" x="34" y="261">Ответ</text>
+  <text class="answer-sub" x="122" y="261">цвет стрелок · номер метки · длина маршрута</text>
+
+  <text class="foot" x="12" y="308">Все шаги детерминированы: один кадр и config/routes.json дают один и тот же ответ,</text>
+  <text class="foot" x="12" y="326">а промежуточные маски, граф и длины можно сохранить и проверить.</text>
+</svg>
