@@ -39,6 +39,8 @@ class FakeLink:
         tilt_error: Exception | None = None,
         can_move: bool = True,
         can_translate: bool = True,
+        can_turn: bool = True,
+        yaw_available: bool = True,
         interrupt_on_velocity: bool = False,
         yaw_deg: float = 0.0,
     ) -> None:
@@ -47,6 +49,8 @@ class FakeLink:
         self.tilt_error = tilt_error
         self.can_move = can_move
         self.can_translate = can_translate
+        self.can_turn = can_turn
+        self.yaw_available = yaw_available
         self.interrupt_on_velocity = interrupt_on_velocity
         self.yaw_deg = yaw_deg
         self.state = "ON_LAND"
@@ -56,6 +60,7 @@ class FakeLink:
         self.vx = 0.0
         self.vy = 0.0
         self.vz = 0.0
+        self.yaw_rate = 0.0
         self.angle = None
         self.land_calls = 0
         self.photo_calls = 0
@@ -74,12 +79,16 @@ class FakeLink:
                 yaw = math.radians(self.yaw_deg)
                 self.x += (self.vx * math.cos(yaw) - self.vy * math.sin(yaw)) * dt
                 self.y += (self.vx * math.sin(yaw) + self.vy * math.cos(yaw)) * dt
+            if self.can_turn:
+                self.yaw_deg = (
+                    self.yaw_deg + self.yaw_rate * dt + 180.0
+                ) % 360.0 - 180.0
         return Telemetry(
             state=self.state,
             battery_v=8.2,
             position=(self.x, self.y, self.z),
             altitude_m=self.z,
-            yaw_deg=self.yaw_deg,
+            yaw_deg=self.yaw_deg if self.yaw_available else None,
         )
 
     def takeoff(self) -> bool:
@@ -91,12 +100,12 @@ class FakeLink:
     def land(self) -> bool:
         self.state = "ON_LAND"
         self.z = 0.0
-        self.vx = self.vy = self.vz = 0.0
+        self.vx = self.vy = self.vz = self.yaw_rate = 0.0
         self.land_calls += 1
         return True
 
     def stop(self) -> None:
-        self.vx = self.vy = self.vz = 0.0
+        self.vx = self.vy = self.vz = self.yaw_rate = 0.0
 
     def set_velocity(self, vx, vy, vz, yaw_rate_deg, interval=0.2) -> None:
         if self.interrupt_on_velocity:
@@ -104,6 +113,7 @@ class FakeLink:
         self.vx = float(vx)
         self.vy = float(vy)
         self.vz = float(vz)
+        self.yaw_rate = float(yaw_rate_deg)
 
     def set_camera_angle(self, angle, priority="high", attempts=3) -> bool:
         if self.tilt_error is not None:
@@ -156,20 +166,23 @@ class PhotoMissionTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertIsNotNone(result.photo)
         self.assertTrue(result.photo.name.endswith(".jpg"))
-        self.assertEqual(len(result.photos), 5)
+        # Five stops, three headings each: forward, 45° right and 90° right.
+        self.assertEqual(len(result.photos), 15)
         self.assertEqual(result.photo, result.photos[-1])
-        self.assertEqual(result.photo_attempts, 5)
+        self.assertEqual(result.photo_attempts, 15)
         self.assertAlmostEqual(result.climbed_m, 2.7, delta=0.06)
         self.assertEqual(link.state, "ON_LAND")
         self.assertEqual(link.land_calls, 1)
         self.assertAlmostEqual(link.x, 0.5, delta=0.1)
         self.assertAlmostEqual(link.y, 0.5, delta=0.1)
         self.assertAlmostEqual(link.angle, -80.0)  # physical -90 → SDK -80
+        self.assertAlmostEqual(link.yaw_deg, 0.0, delta=3.0)
 
         events = _events(records)
-        self.assertEqual(events.count("photo"), 5)
+        self.assertEqual(events.count("photo"), 15)
         self.assertEqual(events.count("stop_start"), 5)
         self.assertEqual(events.count("stop_done"), 5)
+        self.assertEqual(events.count("turn_done"), 15)  # three turns per stop
         self.assertEqual(events.count("move_done"), 4)  # the first stop is takeoff
         start = records[events.index("mission_start")]
         self.assertEqual(start["altitude_m"], 2.7)
@@ -203,6 +216,7 @@ class PhotoMissionTests(unittest.TestCase):
             target_x_m=0.5,
             target_y_m=0.5,
             move_tolerance_m=0.01,
+            turn_photo_angles_deg=(0.0,),
         )
         result, _records, link, _clock = _run(config)
 
@@ -247,6 +261,7 @@ class PhotoMissionTests(unittest.TestCase):
             stop_count=1,
             photo_retries=3,
             photo_delay_s=0.2,
+            turn_photo_angles_deg=(0.0,),
         )
         result, records, link, _clock = _run(config, photo_failures=3)
 
@@ -293,6 +308,73 @@ class PhotoMissionTests(unittest.TestCase):
         self.assertIn("mission_interrupted", _events(records))
 
 
+class TurnPhotoTests(unittest.TestCase):
+    def test_three_photos_per_stop_and_heading_restored(self):
+        config = MissionConfig(
+            altitude_m=1.5,
+            settle_s=0.0,
+            stop_count=2,
+            yaw_settle_s=0.0,
+        )
+        result, records, link, _clock = _run(config)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(result.photos), 6)
+        self.assertAlmostEqual(link.yaw_deg, 0.0, delta=3.0)
+
+        events = _events(records)
+        self.assertEqual(events.count("turn_done"), 6)  # 45°, 90° and back
+        angles = [r["angle_deg"] for r in records if r["event"] == "photo"]
+        self.assertEqual(angles, [0.0, -45.0, -90.0] * 2)
+        # The photo at -90° is really taken with the drone turned right.
+        yaw_at_second = [
+            r["yaw_deg"]
+            for r in records
+            if r["event"] == "turn_done" and r["angle_deg"] == -45.0
+        ]
+        self.assertTrue(all(abs(yaw + 45.0) <= 3.0 for yaw in yaw_at_second))
+
+    def test_turn_photos_can_be_disabled(self):
+        config = MissionConfig(
+            altitude_m=1.5,
+            settle_s=0.0,
+            stop_count=2,
+            turn_photo_angles_deg=(0.0,),
+        )
+        result, records, link, _clock = _run(config)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(result.photos), 2)
+        self.assertNotIn("turn_done", _events(records))
+        self.assertAlmostEqual(link.yaw_deg, 0.0, delta=1e-6)
+
+    def test_missing_yaw_keeps_one_photo_per_stop(self):
+        config = MissionConfig(altitude_m=1.5, settle_s=0.0, stop_count=2)
+        result, records, _link, _clock = _run(config, yaw_available=False)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(result.photos), 2)
+        events = _events(records)
+        self.assertIn("turn_unavailable", events)
+        self.assertNotIn("turn_done", events)
+
+    def test_turn_timeout_lands_automatically(self):
+        config = MissionConfig(
+            altitude_m=1.5,
+            settle_s=0.0,
+            stop_count=1,
+            yaw_speed_deg_s=1.0,
+            yaw_timeout_s=1.0,
+        )
+        result, records, link, _clock = _run(config)
+
+        self.assertFalse(result.ok)
+        self.assertIn("поворот", result.reason)
+        self.assertEqual(link.state, "ON_LAND")
+        self.assertEqual(link.land_calls, 1)
+        self.assertIn("auto_land", _events(records))
+
+
 class MissionConfigTests(unittest.TestCase):
     def test_rejects_bad_altitude(self):
         with self.assertRaises(ValueError):
@@ -319,6 +401,31 @@ class MissionConfigTests(unittest.TestCase):
             MissionConfig(move_timeout_s=0)
         with self.assertRaises(ValueError):
             MissionConfig(target_x_m=float("nan"))
+
+    def test_accepts_default_turn_settings(self):
+        self.assertEqual(MissionConfig().turn_photo_angles_deg, (0.0, -45.0, -90.0))
+        self.assertEqual(
+            MissionConfig(turn_photo_angles_deg=(0.0,)).turn_photo_angles_deg,
+            (0.0,),
+        )
+
+    def test_rejects_bad_turn_settings(self):
+        with self.assertRaises(ValueError):
+            MissionConfig(turn_photo_angles_deg=())
+        with self.assertRaises(ValueError):
+            MissionConfig(turn_photo_angles_deg=(45.0,))
+        with self.assertRaises(ValueError):
+            MissionConfig(turn_photo_angles_deg=(0.0, 200.0))
+        with self.assertRaises(ValueError):
+            MissionConfig(turn_photo_angles_deg=(0.0, 45.0, 30.0))
+        with self.assertRaises(ValueError):
+            MissionConfig(yaw_speed_deg_s=0)
+        with self.assertRaises(ValueError):
+            MissionConfig(yaw_tolerance_deg=0)
+        with self.assertRaises(ValueError):
+            MissionConfig(yaw_timeout_s=0)
+        with self.assertRaises(ValueError):
+            MissionConfig(yaw_settle_s=-1)
 
 
 class HeightTests(unittest.TestCase):

@@ -106,7 +106,12 @@ JSONL-журнал событием `routes`. Подробности — `docs/d
 python3 photo_mission.py --dry-run              # проверка без железа
 python3 photo_mission.py --local                # взлёт, съёмка, посадка
 python3 photo_mission.py --local --quadrant sw  # полёт в нужную сторону
+python3 photo_mission.py --local --no-turn-photos  # одно фото на остановке
 ```
+
+На каждой остановке снимаются три кадра: по курсу подхода и после разворота
+вправо на 45° и 90°, затем дрон возвращается на курс подхода. Углы задаёт
+`--turn-angles`, развороты выключает `--no-turn-photos`.
 
 После успешной съёмки `photo_mission.py` сам прогоняет фото через
 `mars/arrow_routes.py` и печатает второй по длине маршрут, дублируя его в

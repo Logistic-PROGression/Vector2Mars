@@ -2,9 +2,11 @@
 
 Sequence: tilt the camera straight down, take off, climb to a target height
 above the takeoff point, then fly the route to the target point in equal
-steps. At every step the drone settles and takes a photo, so a frame where
-the field is cut by the border can be replaced by an earlier one. After the
-last stop it descends and lands at the target point.
+steps. At every step the drone settles and takes a photo, then turns in place
+and photographs the same stop at 45° and 90° before turning back to the
+approach heading, so a frame where the field is cut by the border or an arrow
+sits in glare can be replaced by another view. After the last stop it descends
+and lands at the target point.
 
 The module has no curses and no CLI. It is one synchronous function so the
 whole sequence can be exercised against ``SimulatedLink`` or a fake link with
@@ -35,6 +37,10 @@ ALTITUDE_GAIN = 0.8
 # capped by ``move_speed_ms``, so the drone slows down near the target instead
 # of overshooting it.
 HORIZONTAL_GAIN = 0.8
+# Proportional gain of the heading controller, 1/s. The turn rate is capped by
+# ``yaw_speed_deg_s``, so the last few degrees are approached slowly and the
+# airframe does not swing past the requested angle.
+YAW_GAIN = 1.2
 
 
 class MissionError(RuntimeError):
@@ -71,6 +77,15 @@ class MissionConfig:
     # the earlier ones keep the whole field. One stop keeps the old behaviour
     # of a single photo at the target point.
     stop_count: int = 5
+    # Heading offsets of the photos taken at every stop, degrees relative to
+    # the approach heading. The first value must be 0: that is the photo the
+    # mission always takes. Negative angles turn the drone to the right, which
+    # is the SDK convention (positive yaw is counter-clockwise).
+    turn_photo_angles_deg: tuple[float, ...] = (0.0, -45.0, -90.0)
+    yaw_speed_deg_s: float = 30.0
+    yaw_tolerance_deg: float = 3.0
+    yaw_settle_s: float = 1.0
+    yaw_timeout_s: float = 20.0
     photo_retries: int = 3
     photo_delay_s: float = 0.7
     climb_timeout_s: float = 60.0
@@ -111,6 +126,30 @@ class MissionConfig:
             raise ValueError("таймауты должны быть больше 0")
         if self.servo_priority not in ("low", "medium", "high"):
             raise ValueError("приоритет сервопривода: low, medium или high")
+        if not self.turn_photo_angles_deg:
+            raise ValueError("нужен хотя бы один угол съёмки на остановке")
+        if abs(self.turn_photo_angles_deg[0]) > 1e-9:
+            raise ValueError("первый угол съёмки на остановке должен быть 0°")
+        if any(abs(angle) > 180.0 for angle in self.turn_photo_angles_deg):
+            raise ValueError("углы съёмки на остановке должны быть в диапазоне -180…180°")
+        steps = [
+            second - first
+            for first, second in zip(
+                self.turn_photo_angles_deg, self.turn_photo_angles_deg[1:]
+            )
+        ]
+        if steps and not (
+            all(step > 0 for step in steps) or all(step < 0 for step in steps)
+        ):
+            raise ValueError(
+                "углы съёмки должны идти подряд по возрастанию или по убыванию"
+            )
+        if self.yaw_speed_deg_s <= 0:
+            raise ValueError("скорость поворота должна быть больше 0")
+        if self.yaw_tolerance_deg <= 0 or self.yaw_timeout_s <= 0:
+            raise ValueError("допуск и таймаут поворота должны быть больше 0")
+        if self.yaw_settle_s < 0:
+            raise ValueError("пауза после поворота не может быть отрицательной")
 
     @property
     def stop_fractions(self) -> tuple[float, ...]:
@@ -150,6 +189,31 @@ def height_above_ground(telemetry: Telemetry, baseline: Telemetry) -> float | No
     if telemetry.altitude_m is not None and baseline.altitude_m is not None:
         return float(telemetry.altitude_m) - float(baseline.altitude_m)
     return None
+
+
+def normalise_deg(angle: float) -> float:
+    """Wrap an angle in degrees into ``[-180, 180)``.
+
+    Telemetry may report a heading as ``-180…180`` or as ``0…360``; the wrapped
+    difference makes the turn controller independent of that choice.
+    """
+    return (float(angle) + 180.0) % 360.0 - 180.0
+
+
+def _altitude_velocity(
+    telemetry: Telemetry, baseline: Telemetry, config: MissionConfig
+) -> float:
+    """Vertical speed that holds the mission altitude, or 0 without a height.
+
+    A turn is short, so a missing height must not abort the mission; the board
+    keeps roughly the current height while the yaw rate is applied.
+    """
+    height = height_above_ground(telemetry, baseline)
+    if height is None:
+        return 0.0
+    error = config.altitude_m - height
+    limit = config.climb_speed_ms if error >= 0 else config.descend_speed_ms
+    return max(-limit, min(limit, error * ALTITUDE_GAIN))
 
 
 class _TiltHold:
@@ -435,14 +499,94 @@ def _settle(
     tilt: _TiltHold,
     clock: Callable[[], float],
     sleep: Callable[[float], None],
+    seconds: float | None = None,
 ) -> None:
-    """Hover in place after the climb so the frame and the photo are steady."""
-    deadline = clock() + config.settle_s
+    """Hover in place so the frame and the photo are steady.
+
+    ``seconds`` overrides the translation pause: a short one is used after a
+    turn in place, where the airframe only has to stop rotating.
+    """
+    deadline = clock() + (config.settle_s if seconds is None else seconds)
     while clock() < deadline:
         link.set_velocity(0.0, 0.0, 0.0, 0.0, interval=0.2)
         tilt.hold(clock)
         sleep(LOOP_S)
     link.set_velocity(0.0, 0.0, 0.0, 0.0, interval=0.2)
+
+
+def _turn_to(
+    link: DroneLink,
+    config: MissionConfig,
+    baseline: Telemetry,
+    target_deg: float,
+    *,
+    stop: int,
+    angle_deg: float,
+    logger: FlightLogger,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+    tilt: _TiltHold,
+) -> None:
+    """Rotate in place to an absolute heading, keeping the altitude.
+
+    The heading comes from LPS yaw, so the controller works with the angle the
+    board reports instead of counting a fixed turn time. A proportional rate
+    with a cap stops the airframe without swinging past the target; the
+    tolerance absorbs the small drift of the yaw estimate. Missing yaw during
+    the turn is a mission error: the drone would rotate blind.
+    """
+    started = clock()
+    last_log = started
+    target = normalise_deg(target_deg)
+    logger.log(
+        "turn_start",
+        stop=stop,
+        angle_deg=round(angle_deg, 1),
+        target_deg=round(target, 1),
+    )
+    while True:
+        telemetry = _safe_telemetry(link, logger)
+        if telemetry.yaw_deg is None:
+            raise MissionError("нет данных о курсе (LPS yaw): поворот остановлен")
+
+        error = normalise_deg(target - float(telemetry.yaw_deg))
+        if abs(error) <= config.yaw_tolerance_deg:
+            link.set_velocity(0.0, 0.0, 0.0, 0.0, interval=0.2)
+            logger.log(
+                "turn_done",
+                stop=stop,
+                angle_deg=round(angle_deg, 1),
+                target_deg=round(target, 1),
+                yaw_deg=round(float(telemetry.yaw_deg), 1),
+                error_deg=round(error, 1),
+                elapsed_s=round(clock() - started, 1),
+            )
+            return
+
+        if clock() - started > config.yaw_timeout_s:
+            raise MissionError(
+                f"поворот на {angle_deg:.0f}° не выполнен за "
+                f"{config.yaw_timeout_s:.0f} с (ошибка {error:.0f}°)"
+            )
+
+        rate = max(
+            -config.yaw_speed_deg_s,
+            min(config.yaw_speed_deg_s, error * YAW_GAIN),
+        )
+        vz = _altitude_velocity(telemetry, baseline, config)
+        link.set_velocity(0.0, 0.0, vz, rate, interval=0.2)
+        tilt.hold(clock)
+
+        if clock() - last_log >= TELEMETRY_LOG_S:
+            last_log = clock()
+            logger.log(
+                "turn_progress",
+                stop=stop,
+                yaw_deg=round(float(telemetry.yaw_deg), 1),
+                error_deg=round(error, 1),
+                yaw_rate=round(rate, 1),
+            )
+        sleep(LOOP_S)
 
 
 def _take_photo(
@@ -455,21 +599,35 @@ def _take_photo(
     sleep: Callable[[float], None],
     tilt: _TiltHold,
     stop: int | None = None,
+    angle_deg: float = 0.0,
 ) -> tuple[Path | None, int]:
     for attempt in range(1, config.photo_retries + 1):
         path = None
         try:
             path = link.take_photo(photo_dir)
         except Exception as exc:
-            logger.log("photo_error", attempt=attempt, stop=stop, error=str(exc))
+            logger.log(
+                "photo_error",
+                attempt=attempt,
+                stop=stop,
+                angle_deg=round(angle_deg, 1),
+                error=str(exc),
+            )
         if path is not None:
-            logger.log("photo", path=str(path), attempt=attempt, stop=stop)
+            logger.log(
+                "photo",
+                path=str(path),
+                attempt=attempt,
+                stop=stop,
+                angle_deg=round(angle_deg, 1),
+            )
             notice(f"Фото сохранено: {path}")
             return Path(path), attempt
         logger.log(
             "photo_failed",
             attempt=attempt,
             stop=stop,
+            angle_deg=round(angle_deg, 1),
             camera_error=getattr(link, "camera_error", None),
         )
         notice(f"Кадр не получен (попытка {attempt} из {config.photo_retries})")
@@ -477,6 +635,90 @@ def _take_photo(
             sleep(config.photo_delay_s)
             tilt.hold(clock)
     return None, config.photo_retries
+
+
+def _photo_set(
+    link: DroneLink,
+    config: MissionConfig,
+    baseline: Telemetry,
+    logger: FlightLogger,
+    photo_dir: str | Path,
+    notice: Callable[[str], None],
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+    tilt: _TiltHold,
+    stop: int,
+    heading: float | None = None,
+) -> tuple[list[Path], int]:
+    """Photograph one stop straight ahead and after each turn.
+
+    Every angle is applied to one absolute reference heading, so the returned
+    position does not depend on the error left by the previous turn. The
+    reference is captured once after takeoff: reading it again at each stop
+    would carry the few degrees left by a return turn into the next stop and
+    the drone would slowly drift away from the route heading. Only when the
+    reference is unknown is the current telemetry used. Without yaw at all the
+    stop keeps the single forward photo and the mission goes on.
+    """
+    angles = list(config.turn_photo_angles_deg)
+    if heading is None:
+        telemetry = _safe_telemetry(link, logger)
+        if telemetry.yaw_deg is not None:
+            heading = normalise_deg(telemetry.yaw_deg)
+
+    if heading is None or len(angles) <= 1:
+        if heading is None and len(angles) > 1:
+            logger.log("turn_unavailable", stop=stop, error="нет данных о курсе (LPS yaw)")
+            notice("Курс недоступен: на остановке одно фото")
+        photo, attempts = _take_photo(
+            link, config, logger, photo_dir, notice, clock, sleep, tilt,
+            stop=stop, angle_deg=0.0,
+        )
+        return ([photo] if photo is not None else []), attempts
+
+    photos: list[Path] = []
+    attempts = 0
+    for angle in angles:
+        if angle != 0.0:
+            _turn_to(
+                link,
+                config,
+                baseline,
+                heading + angle,
+                stop=stop,
+                angle_deg=angle,
+                logger=logger,
+                clock=clock,
+                sleep=sleep,
+                tilt=tilt,
+            )
+            _settle(link, config, tilt, clock, sleep, seconds=config.yaw_settle_s)
+
+        photo, taken = _take_photo(
+            link, config, logger, photo_dir, notice, clock, sleep, tilt,
+            stop=stop, angle_deg=angle,
+        )
+        attempts += taken
+        if photo is not None:
+            photos.append(photo)
+
+    # Return to the approach heading so the next leg flies the same direction
+    # the previous one did and the field keeps its orientation between stops.
+    if angles[-1] != 0.0:
+        _turn_to(
+            link,
+            config,
+            baseline,
+            heading,
+            stop=stop,
+            angle_deg=-angles[-1],
+            logger=logger,
+            clock=clock,
+            sleep=sleep,
+            tilt=tilt,
+        )
+        _settle(link, config, tilt, clock, sleep, seconds=config.yaw_settle_s)
+    return photos, attempts
 
 
 def _descend(
@@ -585,10 +827,15 @@ def run_photo_mission(
         **dataclasses.asdict(config),
         photo_dir=str(photo_dir),
     )
+    if len(config.turn_photo_angles_deg) > 1:
+        angles = "/".join(f"{angle:g}" for angle in config.turn_photo_angles_deg)
+        photo_plan = f"фото на остановке: {angles}°"
+    else:
+        photo_plan = "одно фото на остановке"
     notice(
         f"Миссия: камера {config.tilt_deg:.0f}°, высота {config.altitude_m:.2f} м, "
         f"точка ({config.target_x_m:.2f}, {config.target_y_m:.2f}) м от взлёта, "
-        f"остановок {config.stop_count}, фото, посадка"
+        f"остановок {config.stop_count}, {photo_plan}"
     )
 
     airborne = False
@@ -627,6 +874,16 @@ def run_photo_mission(
             link, config, baseline, logger, notice, clock, sleep, tilt
         )
 
+        # The heading of the whole mission is captured once: turn photos are
+        # applied to this reference, so the few degrees left after a return
+        # turn are not carried into the next stop.
+        heading_telemetry = _safe_telemetry(link, logger)
+        approach_heading = (
+            None
+            if heading_telemetry.yaw_deg is None
+            else normalise_deg(heading_telemetry.yaw_deg)
+        )
+
         # 4. Fly the route in equal steps, stopping to photograph at each one.
         for stop, fraction in enumerate(config.stop_fractions):
             logger.log("stop_start", stop=stop, fraction=fraction)
@@ -649,19 +906,30 @@ def run_photo_mission(
             # 5. Wait for the airframe and the frame to settle.
             _settle(link, config, tilt, clock, sleep)
 
-            # 6. Photo at this stop.
-            photo, attempts = _take_photo(
-                link, config, logger, photo_dir, notice, clock, sleep, tilt, stop=stop
+            # 6. Photos at this stop: straight ahead, then after each turn.
+            photos, attempts = _photo_set(
+                link,
+                config,
+                baseline,
+                logger,
+                photo_dir,
+                notice,
+                clock,
+                sleep,
+                tilt,
+                stop,
+                heading=approach_heading,
             )
             result.photo_attempts += attempts
-            if photo is not None:
+            for photo in photos:
                 result.photos.append(photo)
                 result.photo = photo
             logger.log(
                 "stop_done",
                 stop=stop,
                 fraction=fraction,
-                photo=None if photo is None else str(photo),
+                photos=[str(photo) for photo in photos],
+                photo=None if not photos else str(photos[-1]),
             )
 
         if not result.photos:

@@ -6,7 +6,9 @@
   2. дрон взлетает;
   3. набор высоты над точкой взлёта (по умолчанию 2.7 м);
   4. перелёт к точке (по умолчанию 0.5, 0.5 м от взлёта) с 5 остановками
-     (0, 25, 50, 75 и 100% пути); на каждой — пауза на стабилизацию и фото;
+     (0, 25, 50, 75 и 100% пути); на каждой — пауза на стабилизацию, фото,
+     затем разворот вправо на 45° и 90° с фото на каждом угле и возврат
+     курса (флаг --no-turn-photos оставляет одно фото на остановке);
   5. снижение и полная посадка в конечной точке;
   6. после посадки кадры анализируются: кадры без меток отбрасываются,
      остальные совмещаются по центрам ArUco-меток, стрелки голосуются по
@@ -83,6 +85,7 @@ class CodeDefaults:
     no_camera: bool = False
     dry_run: bool = False
     annotate_all: bool = False
+    turn_photos: bool = True
     expect_arrows: tuple[int, ...] | None = None
 
 
@@ -114,6 +117,14 @@ CODE_DEFAULTS = CodeDefaults()
 #   --tolerance 0.05        допуск по высоте, м (когда считаем цель достигнутой)
 #   --settle 1.5            пауза на стабилизацию перед фото, с
 #   --stops 5               сколько остановок с фото на пути (5 → 0, 25, 50, 75, 100%)
+#   --turn-photos           фото на остановке с разворотом вправо (по умолчанию включено)
+#   --no-turn-photos        одно фото на остановке, без разворотов
+#   --turn-angles 0 -45 -90 углы фото относительно курса подхода, град
+#                           (отрицательные — вправо; первый всегда 0)
+#   --yaw-speed 30          максимальная скорость разворота, град/с
+#   --yaw-tolerance 3       допуск по курсу, град
+#   --yaw-settle 1.0        пауза после разворота перед фото, с
+#   --yaw-timeout 20        предел времени на один разворот, с
 #   --tilt-settle 1.0       пауза после команды наклона камеры, с
 #   --landing-height 0.25   высота над землёй, с которой начинается посадка, м
 #   --photo-retries 3       сколько раз пытаться получить кадр
@@ -270,6 +281,59 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="число остановок с фото на пути: 5 — равные шаги от взлёта до цели",
     )
     parser.add_argument(
+        "--turn-photos",
+        dest="turn_photos",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="фотографировать остановку с разворотом вправо (0, 45 и 90°)",
+    )
+    parser.add_argument(
+        "--no-turn-photos",
+        dest="turn_photos",
+        action="store_false",
+        default=argparse.SUPPRESS,
+        help="одно фото на остановке, без разворотов",
+    )
+    parser.add_argument(
+        "--turn-angles",
+        nargs="*",
+        type=float,
+        default=list(defaults.turn_photo_angles_deg),
+        metavar="ГРАД",
+        help=(
+            "углы фото относительно курса подхода; отрицательные — вправо, "
+            "первый угол должен быть 0"
+        ),
+    )
+    parser.add_argument(
+        "--yaw-speed",
+        type=float,
+        default=defaults.yaw_speed_deg_s,
+        metavar="ГРАД/С",
+        help="максимальная скорость разворота",
+    )
+    parser.add_argument(
+        "--yaw-tolerance",
+        type=float,
+        default=defaults.yaw_tolerance_deg,
+        metavar="ГРАД",
+        help="допуск по курсу, при котором разворот считается выполненным",
+    )
+    parser.add_argument(
+        "--yaw-settle",
+        type=float,
+        default=defaults.yaw_settle_s,
+        metavar="С",
+        help="пауза после разворота перед фото",
+    )
+    parser.add_argument(
+        "--yaw-timeout",
+        type=float,
+        default=defaults.yaw_timeout_s,
+        metavar="С",
+        help="предел времени на один разворот",
+    )
+    parser.add_argument(
         "--tilt-settle",
         type=float,
         default=defaults.tilt_settle_s,
@@ -370,6 +434,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
             "без флага проверка выключена"
         ),
     )
+    parser.set_defaults(turn_photos=CODE_DEFAULTS.turn_photos)
     return parser.parse_args(argv)
 
 
@@ -618,6 +683,7 @@ def _target_with_quadrant(args: argparse.Namespace) -> tuple[float, float]:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     target_x, target_y = _target_with_quadrant(args)
+    turn_angles = tuple(args.turn_angles) if args.turn_photos else (0.0,)
     try:
         config = MissionConfig(
             altitude_m=args.altitude,
@@ -635,6 +701,11 @@ def main(argv: list[str] | None = None) -> int:
             tolerance_m=args.tolerance,
             settle_s=args.settle,
             stop_count=args.stops,
+            turn_photo_angles_deg=turn_angles,
+            yaw_speed_deg_s=args.yaw_speed,
+            yaw_tolerance_deg=args.yaw_tolerance,
+            yaw_settle_s=args.yaw_settle,
+            yaw_timeout_s=args.yaw_timeout,
             tilt_settle_s=args.tilt_settle,
             landing_height_m=args.landing_height,
             photo_retries=args.photo_retries,
